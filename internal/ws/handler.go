@@ -135,7 +135,7 @@ func (h *Handler) handleAsrStart(session *sessionContext, event clientEvent) {
 	}
 	if !h.app.Asr.Realtime.HasAPIKey() {
 		session.releaseTaskID(taskID)
-		h.sendError(session, taskID, "config_missing", "DASHSCOPE_API_KEY is missing")
+		h.sendError(session, taskID, "config_missing", "ASR realtime API key is missing")
 		return
 	}
 
@@ -229,7 +229,7 @@ func (h *Handler) handleTtsStart(session *sessionContext, event clientEvent) {
 	}
 	if !h.ttsService.IsLocalConfigured() {
 		session.releaseTaskID(taskID)
-		h.sendError(session, taskID, "config_missing", "DASHSCOPE_TTS_API_KEY is missing")
+		h.sendError(session, taskID, "config_missing", "Local TTS API key is missing")
 		return
 	}
 	if mode == "llm" && !h.app.Tts.Llm.Runner.IsConfigured() {

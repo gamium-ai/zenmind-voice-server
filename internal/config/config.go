@@ -2,6 +2,7 @@ package config
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -80,7 +81,12 @@ func Load(root string) (*App, error) {
 	}
 
 	cfg := defaults()
-	applyEnv(cfg)
+	if err := applyEnv(cfg); err != nil {
+		return nil, err
+	}
+	if err := validate(cfg); err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }
 
@@ -89,8 +95,6 @@ func defaults() *App {
 		ServerPort: 11953,
 		Asr: AsrProperties{
 			Realtime: RealtimeProxyProperties{
-				BaseURL:                "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
-				Model:                  "qwen3-asr-flash-realtime",
 				ConnectTimeoutMs:       10000,
 				MaxClientEventBytes:    1048576,
 				MaxAppendAudioChars:    2097152,
@@ -101,8 +105,6 @@ func defaults() *App {
 		Tts: TtsProperties{
 			DefaultMode: "local",
 			Local: LocalTtsProperties{
-				Endpoint:                 "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
-				Model:                    "qwen3-tts-instruct-flash-realtime",
 				Mode:                     "server_commit",
 				ResponseFormat:           "pcm",
 				SpeechRate:               1.2,
@@ -113,46 +115,116 @@ func defaults() *App {
 					RequestTimeoutMs: 120000,
 				},
 			},
-			Voices: VoiceCatalogProperties{
-				DefaultVoice: "Cherry",
-				Options: []VoiceOption{
-					{ID: "Cherry", DisplayName: "Cherry", Provider: "dashscope"},
-					{ID: "Ethan", DisplayName: "Ethan", Provider: "dashscope"},
-					{ID: "Serena", DisplayName: "Serena", Provider: "dashscope"},
-				},
-			},
+			Voices: VoiceCatalogProperties{},
 		},
 	}
 }
 
-func applyEnv(cfg *App) {
+func applyEnv(cfg *App) error {
 	cfg.ServerPort = envInt("SERVER_PORT", cfg.ServerPort)
-	cfg.Asr.Realtime.BaseURL = envString("DASHSCOPE_REALTIME_BASE_URL", cfg.Asr.Realtime.BaseURL)
-	cfg.Asr.Realtime.Model = envString("DASHSCOPE_REALTIME_MODEL", cfg.Asr.Realtime.Model)
-	cfg.Asr.Realtime.APIKey = envString("DASHSCOPE_API_KEY", cfg.Asr.Realtime.APIKey)
-	cfg.Asr.Realtime.ConnectTimeoutMs = envInt("DASHSCOPE_REALTIME_CONNECT_TIMEOUT_MS", cfg.Asr.Realtime.ConnectTimeoutMs)
-	cfg.Asr.Realtime.MaxClientEventBytes = envInt("DASHSCOPE_REALTIME_MAX_CLIENT_EVENT_BYTES", cfg.Asr.Realtime.MaxClientEventBytes)
-	cfg.Asr.Realtime.MaxAppendAudioChars = envInt("DASHSCOPE_REALTIME_MAX_APPEND_AUDIO_CHARS", cfg.Asr.Realtime.MaxAppendAudioChars)
-	cfg.Asr.Realtime.MaxPendingClientEvents = envInt("DASHSCOPE_REALTIME_MAX_PENDING_CLIENT_EVENTS", cfg.Asr.Realtime.MaxPendingClientEvents)
-	cfg.Asr.Realtime.MaxPendingClientBytes = envInt("DASHSCOPE_REALTIME_MAX_PENDING_CLIENT_BYTES", cfg.Asr.Realtime.MaxPendingClientBytes)
+	cfg.Asr.Realtime.BaseURL = envString("APP_VOICE_ASR_REALTIME_BASE_URL", cfg.Asr.Realtime.BaseURL)
+	cfg.Asr.Realtime.Model = envString("APP_VOICE_ASR_REALTIME_MODEL", cfg.Asr.Realtime.Model)
+	cfg.Asr.Realtime.APIKey = envString("APP_VOICE_ASR_REALTIME_API_KEY", cfg.Asr.Realtime.APIKey)
+	cfg.Asr.Realtime.ConnectTimeoutMs = envInt("APP_VOICE_ASR_REALTIME_CONNECT_TIMEOUT_MS", cfg.Asr.Realtime.ConnectTimeoutMs)
+	cfg.Asr.Realtime.MaxClientEventBytes = envInt("APP_VOICE_ASR_REALTIME_MAX_CLIENT_EVENT_BYTES", cfg.Asr.Realtime.MaxClientEventBytes)
+	cfg.Asr.Realtime.MaxAppendAudioChars = envInt("APP_VOICE_ASR_REALTIME_MAX_APPEND_AUDIO_CHARS", cfg.Asr.Realtime.MaxAppendAudioChars)
+	cfg.Asr.Realtime.MaxPendingClientEvents = envInt("APP_VOICE_ASR_REALTIME_MAX_PENDING_CLIENT_EVENTS", cfg.Asr.Realtime.MaxPendingClientEvents)
+	cfg.Asr.Realtime.MaxPendingClientBytes = envInt("APP_VOICE_ASR_REALTIME_MAX_PENDING_CLIENT_BYTES", cfg.Asr.Realtime.MaxPendingClientBytes)
 
 	cfg.Tts.DefaultMode = envString("APP_VOICE_TTS_DEFAULT_MODE", cfg.Tts.DefaultMode)
-	cfg.Tts.Local.Endpoint = envString("DASHSCOPE_TTS_ENDPOINT", cfg.Tts.Local.Endpoint)
-	cfg.Tts.Local.Model = envString("DASHSCOPE_TTS_MODEL", cfg.Tts.Local.Model)
-	cfg.Tts.Local.APIKey = envString("DASHSCOPE_TTS_API_KEY", envString("DASHSCOPE_API_KEY", cfg.Tts.Local.APIKey))
-	cfg.Tts.Local.Mode = envString("DASHSCOPE_TTS_MODE", cfg.Tts.Local.Mode)
-	cfg.Tts.Local.ResponseFormat = envString("DASHSCOPE_TTS_RESPONSE_FORMAT", cfg.Tts.Local.ResponseFormat)
-	cfg.Tts.Local.SpeechRate = envFloat("DASHSCOPE_TTS_SPEECH_RATE", cfg.Tts.Local.SpeechRate)
-	cfg.Tts.Local.Instructions = envString("DASHSCOPE_TTS_INSTRUCTIONS", cfg.Tts.Local.Instructions)
-	cfg.Tts.Local.SessionFinishedTimeoutMs = envInt("DASHSCOPE_TTS_SESSION_FINISHED_TIMEOUT_MS", cfg.Tts.Local.SessionFinishedTimeoutMs)
-	cfg.Tts.Local.LogSentChunkEnabled = envBool("DASHSCOPE_TTS_LOG_SENT_CHUNK_ENABLED", cfg.Tts.Local.LogSentChunkEnabled)
+	cfg.Tts.Local.Endpoint = envString("APP_VOICE_TTS_LOCAL_ENDPOINT", cfg.Tts.Local.Endpoint)
+	cfg.Tts.Local.Model = envString("APP_VOICE_TTS_LOCAL_MODEL", cfg.Tts.Local.Model)
+	cfg.Tts.Local.APIKey = envString("APP_VOICE_TTS_LOCAL_API_KEY", cfg.Tts.Local.APIKey)
+	cfg.Tts.Local.Mode = envString("APP_VOICE_TTS_LOCAL_MODE", cfg.Tts.Local.Mode)
+	cfg.Tts.Local.ResponseFormat = envString("APP_VOICE_TTS_LOCAL_RESPONSE_FORMAT", cfg.Tts.Local.ResponseFormat)
+	cfg.Tts.Local.SpeechRate = envFloat("APP_VOICE_TTS_LOCAL_SPEECH_RATE", cfg.Tts.Local.SpeechRate)
+	cfg.Tts.Local.Instructions = envString("APP_VOICE_TTS_LOCAL_INSTRUCTIONS", cfg.Tts.Local.Instructions)
+	cfg.Tts.Local.SessionFinishedTimeoutMs = envInt("APP_VOICE_TTS_LOCAL_SESSION_FINISHED_TIMEOUT_MS", cfg.Tts.Local.SessionFinishedTimeoutMs)
+	cfg.Tts.Local.LogSentChunkEnabled = envBool("APP_VOICE_TTS_LOCAL_LOG_SENT_CHUNK_ENABLED", cfg.Tts.Local.LogSentChunkEnabled)
 
 	cfg.Tts.Llm.Runner.BaseURL = envString("APP_VOICE_TTS_LLM_RUNNER_BASE_URL", cfg.Tts.Llm.Runner.BaseURL)
 	cfg.Tts.Llm.Runner.AuthorizationToken = envString("APP_VOICE_TTS_LLM_RUNNER_AUTHORIZATION_TOKEN", cfg.Tts.Llm.Runner.AuthorizationToken)
 	cfg.Tts.Llm.Runner.AgentKey = envString("APP_VOICE_TTS_LLM_RUNNER_AGENT_KEY", cfg.Tts.Llm.Runner.AgentKey)
 	cfg.Tts.Llm.Runner.RequestTimeoutMs = envInt("APP_VOICE_TTS_LLM_RUNNER_REQUEST_TIMEOUT_MS", cfg.Tts.Llm.Runner.RequestTimeoutMs)
 
-	cfg.Tts.Voices.DefaultVoice = envString("DASHSCOPE_TTS_DEFAULT_VOICE", cfg.Tts.Voices.DefaultVoice)
+	cfg.Tts.Voices.DefaultVoice = envString("APP_VOICE_TTS_DEFAULT_VOICE", cfg.Tts.Voices.DefaultVoice)
+
+	voiceOptions, err := envVoiceOptions("APP_VOICE_TTS_VOICES_JSON", cfg.Tts.Voices.Options)
+	if err != nil {
+		return err
+	}
+	cfg.Tts.Voices.Options = voiceOptions
+	return nil
+}
+
+func validate(cfg *App) error {
+	var missing []string
+	if strings.TrimSpace(cfg.Asr.Realtime.BaseURL) == "" {
+		missing = append(missing, "APP_VOICE_ASR_REALTIME_BASE_URL")
+	}
+	if strings.TrimSpace(cfg.Asr.Realtime.Model) == "" {
+		missing = append(missing, "APP_VOICE_ASR_REALTIME_MODEL")
+	}
+	if strings.TrimSpace(cfg.Tts.Local.Endpoint) == "" {
+		missing = append(missing, "APP_VOICE_TTS_LOCAL_ENDPOINT")
+	}
+	if strings.TrimSpace(cfg.Tts.Local.Model) == "" {
+		missing = append(missing, "APP_VOICE_TTS_LOCAL_MODEL")
+	}
+	if strings.TrimSpace(cfg.Tts.Voices.DefaultVoice) == "" {
+		missing = append(missing, "APP_VOICE_TTS_DEFAULT_VOICE")
+	}
+	if len(cfg.Tts.Voices.Options) == 0 {
+		missing = append(missing, "APP_VOICE_TTS_VOICES_JSON")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing required configuration: %s", strings.Join(missing, ", "))
+	}
+
+	defaultVoice := strings.TrimSpace(cfg.Tts.Voices.DefaultVoice)
+	seenVoiceIDs := make(map[string]struct{}, len(cfg.Tts.Voices.Options))
+	foundDefault := false
+	for _, option := range cfg.Tts.Voices.Options {
+		voiceID := strings.TrimSpace(option.ID)
+		if voiceID == "" {
+			return fmt.Errorf("invalid APP_VOICE_TTS_VOICES_JSON: voice id is required")
+		}
+		normalizedID := strings.ToLower(voiceID)
+		if _, exists := seenVoiceIDs[normalizedID]; exists {
+			return fmt.Errorf("invalid APP_VOICE_TTS_VOICES_JSON: duplicate voice id %q", voiceID)
+		}
+		seenVoiceIDs[normalizedID] = struct{}{}
+		if strings.EqualFold(voiceID, defaultVoice) {
+			foundDefault = true
+		}
+	}
+	if !foundDefault {
+		return fmt.Errorf("invalid configuration: APP_VOICE_TTS_DEFAULT_VOICE %q is not present in APP_VOICE_TTS_VOICES_JSON", cfg.Tts.Voices.DefaultVoice)
+	}
+	return nil
+}
+
+func envVoiceOptions(key string, fallback []VoiceOption) ([]VoiceOption, error) {
+	value, ok := os.LookupEnv(key)
+	if !ok {
+		return fallback, nil
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+
+	var options []VoiceOption
+	if err := json.Unmarshal([]byte(value), &options); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", key, err)
+	}
+	for i := range options {
+		options[i].ID = strings.TrimSpace(options[i].ID)
+		options[i].DisplayName = strings.TrimSpace(options[i].DisplayName)
+		options[i].Provider = strings.TrimSpace(options[i].Provider)
+		options[i].Instructions = strings.TrimSpace(options[i].Instructions)
+	}
+	return options, nil
 }
 
 func (c *App) ListenAddr() string {

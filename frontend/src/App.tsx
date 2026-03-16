@@ -275,7 +275,9 @@ export default function App() {
   const [viewMode, setViewMode] = useState<ViewMode>('test');
   const [capabilities, setCapabilities] = useState<CapabilitiesResponse | null>(null);
   const [voices, setVoices] = useState<VoiceOption[]>([]);
-  const [selectedVoice, setSelectedVoice] = useState('Cherry');
+  const [voicesLoaded, setVoicesLoaded] = useState(false);
+  const [voicesError, setVoicesError] = useState('');
+  const [selectedVoice, setSelectedVoice] = useState('');
   const [ttsSpeechRate, setTtsSpeechRate] = useState(1.2);
 
   const [testAsrStatus, setTestAsrStatus] = useState<Status>('READY');
@@ -889,6 +891,10 @@ export default function App() {
       setTestTtsError('请输入要测试的文本。');
       return;
     }
+    if (!voiceSelectionReady) {
+      setTestTtsError(voiceUnavailableMessage);
+      return;
+    }
 
     resetTestTtsView();
     setTestTtsLogs([]);
@@ -918,6 +924,13 @@ export default function App() {
   }
 
   function startQaTts(text: string) {
+    if (!voiceSelectionReady) {
+      setQaError(voiceUnavailableMessage);
+      setQaStatusValue('ERROR');
+      setQaSessionActiveValue(false);
+      qaAwaitingUserRef.current = false;
+      return;
+    }
     qaAcceptChatUpdatesRef.current = true;
     setQaTtsStatusValue('CONNECTING');
     pendingBinaryRef.current = pendingBinaryRef.current.filter((item) => item.taskId !== QA_TTS_TASK_ID);
@@ -951,6 +964,10 @@ export default function App() {
     }
     if (capabilities?.tts?.runnerConfigured === false) {
       setQaError('当前后端未配置 runner，QA 模式不可用。');
+      return;
+    }
+    if (!voiceSelectionReady) {
+      setQaError(voiceUnavailableMessage);
       return;
     }
 
@@ -1074,12 +1091,19 @@ export default function App() {
       .then((data) => {
         const nextVoices = Array.isArray(data.voices) ? (data.voices as VoiceOption[]) : [];
         setVoices(nextVoices);
-        if (typeof data.defaultVoice === 'string' && data.defaultVoice) {
-          setSelectedVoice(data.defaultVoice);
-        }
+        const nextDefaultVoice =
+          typeof data.defaultVoice === 'string' && data.defaultVoice
+            ? data.defaultVoice
+            : nextVoices.find((voice) => voice.default)?.id ?? nextVoices[0]?.id ?? '';
+        setSelectedVoice(nextDefaultVoice);
+        setVoicesError(nextVoices.length === 0 ? '当前没有可用音色配置。' : '');
+        setVoicesLoaded(true);
       })
-      .catch(() => {
-        setVoices([{ id: 'Cherry', displayName: 'Cherry', provider: 'dashscope', default: true }]);
+      .catch((error) => {
+        setVoices([]);
+        setSelectedVoice('');
+        setVoicesError(`音色列表加载失败: ${error instanceof Error ? error.message : String(error)}`);
+        setVoicesLoaded(true);
       });
   }, []);
 
@@ -1091,8 +1115,12 @@ export default function App() {
     };
   }, []);
 
-  const qaModeUnavailable = capabilities?.tts?.runnerConfigured === false;
-  const qaStartDisabled = qaModeUnavailable || qaSessionActive || qaStatus === 'STARTING' || qaStatus === 'THINKING' || qaStatus === 'SPEAKING';
+  const voiceSelectionReady = voices.length > 0 && selectedVoice.trim().length > 0;
+  const noVoicesConfigured = voicesLoaded && !voiceSelectionReady;
+  const voiceUnavailableMessage = voicesError || '当前没有可用音色配置。';
+  const runnerUnavailable = capabilities?.tts?.runnerConfigured === false;
+  const qaModeUnavailable = runnerUnavailable || noVoicesConfigured;
+  const qaStartDisabled = runnerUnavailable || !voiceSelectionReady || qaSessionActive || qaStatus === 'STARTING' || qaStatus === 'THINKING' || qaStatus === 'SPEAKING';
   const qaStopDisabled = !qaSessionActive && !isTaskActive(qaAsrStatusRef.current) && !isTaskActive(qaTtsStatusRef.current);
   const qaStatusText =
     qaStatus === 'IDLE'
@@ -1209,7 +1237,8 @@ export default function App() {
               <div className="field-grid">
                 <label>
                   <span>Voice</span>
-                  <select value={selectedVoice} onChange={(event) => setSelectedVoice(event.target.value)}>
+                  <select value={selectedVoice} onChange={(event) => setSelectedVoice(event.target.value)} disabled={voices.length === 0}>
+                    {voices.length === 0 ? <option value="">No voices available</option> : null}
                     {voices.map((voice) => (
                       <option key={voice.id} value={voice.id}>
                         {voice.displayName}
@@ -1238,7 +1267,11 @@ export default function App() {
               </label>
 
               <div className="actions">
-                <button className="primary" onClick={startTestTts} disabled={testTtsStatus === 'CONNECTING' || testTtsStatus === 'STREAMING'}>
+                <button
+                  className="primary"
+                  onClick={startTestTts}
+                  disabled={!voiceSelectionReady || testTtsStatus === 'CONNECTING' || testTtsStatus === 'STREAMING'}
+                >
                   Start TTS
                 </button>
                 <button className="ghost" onClick={stopTestTts} disabled={!isTaskActive(testTtsStatus)}>
@@ -1247,6 +1280,7 @@ export default function App() {
               </div>
 
               {testTtsError ? <p className="error-text">{testTtsError}</p> : null}
+              {!testTtsError && noVoicesConfigured ? <p className="error-text">{voiceUnavailableMessage}</p> : null}
 
               <div className="result-card">
                 <div className="result-label">Rendered Text</div>
@@ -1284,7 +1318,8 @@ export default function App() {
               <div className="field-grid">
                 <label>
                   <span>Voice</span>
-                  <select value={selectedVoice} onChange={(event) => setSelectedVoice(event.target.value)}>
+                  <select value={selectedVoice} onChange={(event) => setSelectedVoice(event.target.value)} disabled={voices.length === 0}>
+                    {voices.length === 0 ? <option value="">No voices available</option> : null}
                     {voices.map((voice) => (
                       <option key={voice.id} value={voice.id}>
                         {voice.displayName}
@@ -1337,9 +1372,10 @@ export default function App() {
                 </div>
               </div>
 
-              {qaModeUnavailable ? <p className="warn-text">当前后端未配置 runner，QA 模式不可用。</p> : null}
+              {runnerUnavailable ? <p className="warn-text">当前后端未配置 runner，QA 模式不可用。</p> : null}
               {qaNotice ? <p className="warn-text">{qaNotice}</p> : null}
               {qaError ? <p className="error-text">{qaError}</p> : null}
+              {!qaError && noVoicesConfigured ? <p className="error-text">{voiceUnavailableMessage}</p> : null}
 
               <div className="qa-summary-row">
                 <div className="result-card qa-summary-card">

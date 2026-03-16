@@ -20,7 +20,7 @@ func TestConnectFailsWhenAPIKeyMissing(t *testing.T) {
 	gateway := NewDashScopeRealtimeGateway(app)
 
 	_, err := gateway.Connect(context.Background(), "client-1", ConnectOptions{}, noopListener{})
-	if err == nil || err.Error() != "DASHSCOPE_API_KEY is missing" {
+	if err == nil || err.Error() != "missing configuration: ASR realtime API key" {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

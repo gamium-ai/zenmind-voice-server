@@ -52,17 +52,18 @@
 
 ### `GET /api/voice/tts/voices`
 返回允许使用的音色白名单。
+其中 `defaultVoice` 和 `voices[*]` 的具体值完全来自部署配置，不是协议固定常量。
 
 响应示例：
 
 ```json
 {
-  "defaultVoice": "Cherry",
+  "defaultVoice": "voice-demo",
   "voices": [
     {
-      "id": "Cherry",
-      "displayName": "Cherry",
-      "provider": "dashscope",
+      "id": "voice-demo",
+      "displayName": "Voice Demo",
+      "provider": "provider-demo",
       "default": true
     }
   ]
@@ -197,7 +198,7 @@
   "taskId": "tts-demo",
   "mode": "local",
   "text": "你好，欢迎使用统一语音服务。",
-  "voice": "Cherry",
+  "voice": "voice-demo",
   "speechRate": 1.2
 }
 ```
@@ -369,7 +370,7 @@ socket.onopen = () => {
     taskId: "tts-demo",
     mode: "local",
     text: "你好，欢迎接入统一语音服务。",
-    voice: "Cherry"
+    voice: "voice-demo"
   }));
 };
 ```

@@ -58,7 +58,7 @@ func NewDashScopeRealtimeGateway(app *config.App) *DashScopeRealtimeGateway {
 func (g *DashScopeRealtimeGateway) Connect(ctx context.Context, _ string, options ConnectOptions, listener UpstreamListener) (RealtimeUpstreamSession, error) {
 	apiKey := strings.TrimSpace(g.props.APIKey)
 	if apiKey == "" {
-		return nil, fmt.Errorf("DASHSCOPE_API_KEY is missing")
+		return nil, fmt.Errorf("missing configuration: ASR realtime API key")
 	}
 
 	timeout := time.Duration(g.props.ConnectTimeoutMs) * time.Millisecond

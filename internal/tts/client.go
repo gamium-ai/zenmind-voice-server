@@ -36,19 +36,19 @@ func NewDashScopeRealtimeClient(app *config.App) *DashScopeRealtimeClient {
 func (c *DashScopeRealtimeClient) OpenSession(options core.TtsRequestOptions) (TtsStreamSession, error) {
 	endpoint := strings.TrimSpace(c.props.Endpoint)
 	if endpoint == "" {
-		return nil, fmt.Errorf("missing configuration: dashscope tts endpoint")
+		return nil, fmt.Errorf("missing configuration: local TTS endpoint")
 	}
 	apiKey := strings.TrimSpace(c.props.APIKey)
 	if apiKey == "" {
-		return nil, fmt.Errorf("missing configuration: dashscope tts api-key")
+		return nil, fmt.Errorf("missing configuration: local TTS API key")
 	}
 	model := firstNonBlank(strings.TrimSpace(options.Model), strings.TrimSpace(c.props.Model))
 	if model == "" {
-		return nil, fmt.Errorf("missing configuration: dashscope tts model")
+		return nil, fmt.Errorf("missing configuration: local TTS model")
 	}
 	voice := strings.TrimSpace(options.Voice)
 	if voice == "" {
-		return nil, fmt.Errorf("missing configuration: dashscope tts voice")
+		return nil, fmt.Errorf("missing configuration: TTS voice")
 	}
 
 	rawResponseFormat := firstNonBlank(options.ResponseFormat, c.props.ResponseFormat)
