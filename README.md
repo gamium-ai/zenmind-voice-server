@@ -55,6 +55,7 @@ make test
 - `voice-server` 的 `env_file: .env` 属于容器运行时环境注入
 - 最重要的部署路径约束是 `/api/voice/*`
 - 若由总网关接入，应直接把 `/api/voice/*` 反代到 backend，而不是依赖 console 前端
+- LLM QA 模式支持由客户端在 `tts.start.agentKey` 中动态指定员工；`APP_VOICE_TTS_LLM_RUNNER_AGENT_KEY` 仅作为默认回退。
 
 ## 4. 部署
 

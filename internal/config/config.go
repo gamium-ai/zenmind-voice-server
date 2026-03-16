@@ -240,7 +240,7 @@ func (l LocalTtsProperties) HasAPIKey() bool {
 }
 
 func (r RunnerProperties) IsConfigured() bool {
-	return strings.TrimSpace(r.BaseURL) != "" && strings.TrimSpace(r.AgentKey) != ""
+	return strings.TrimSpace(r.BaseURL) != ""
 }
 
 func (v VoiceCatalogProperties) SortedOptions() []VoiceOption {

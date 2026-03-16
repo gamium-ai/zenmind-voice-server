@@ -15,7 +15,7 @@ import (
 )
 
 type Client interface {
-	StreamEvents(ctx context.Context, message, chatID string) (<-chan Event, <-chan error)
+	StreamEvents(ctx context.Context, message, chatID, agentKey string) (<-chan Event, <-chan error)
 }
 
 type Event struct {
@@ -50,7 +50,7 @@ func NewHTTPClient(app *config.App) *HTTPClient {
 	}
 }
 
-func (c *HTTPClient) StreamEvents(ctx context.Context, message, chatID string) (<-chan Event, <-chan error) {
+func (c *HTTPClient) StreamEvents(ctx context.Context, message, chatID, agentKey string) (<-chan Event, <-chan error) {
 	eventCh := make(chan Event, 16)
 	errCh := make(chan error, 1)
 
@@ -63,7 +63,7 @@ func (c *HTTPClient) StreamEvents(ctx context.Context, message, chatID string) (
 			return
 		}
 
-		req, err := c.buildRequest(ctx, message, chatID)
+		req, err := c.buildRequest(ctx, message, chatID, agentKey)
 		if err != nil {
 			errCh <- err
 			return
@@ -90,8 +90,8 @@ func (c *HTTPClient) StreamEvents(ctx context.Context, message, chatID string) (
 	return eventCh, errCh
 }
 
-func (c *HTTPClient) buildRequest(ctx context.Context, message, chatID string) (*http.Request, error) {
-	payload, err := json.Marshal(c.BuildRequestPayload(message, chatID))
+func (c *HTTPClient) buildRequest(ctx context.Context, message, chatID, agentKey string) (*http.Request, error) {
+	payload, err := json.Marshal(c.BuildRequestPayload(message, chatID, agentKey))
 	if err != nil {
 		return nil, err
 	}
@@ -109,11 +109,17 @@ func (c *HTTPClient) buildRequest(ctx context.Context, message, chatID string) (
 	return req, nil
 }
 
-func (c *HTTPClient) BuildRequestPayload(message, chatID string) map[string]any {
+func (c *HTTPClient) BuildRequestPayload(message, chatID, agentKey string) map[string]any {
+	resolvedAgentKey := strings.TrimSpace(agentKey)
+	if resolvedAgentKey == "" {
+		resolvedAgentKey = strings.TrimSpace(c.props.AgentKey)
+	}
 	payload := map[string]any{
-		"message":  message,
-		"agentKey": c.props.AgentKey,
-		"stream":   true,
+		"message": message,
+		"stream":  true,
+	}
+	if resolvedAgentKey != "" {
+		payload["agentKey"] = resolvedAgentKey
 	}
 	if strings.TrimSpace(chatID) != "" {
 		payload["chatId"] = chatID

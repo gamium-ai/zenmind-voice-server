@@ -277,6 +277,37 @@ func TestLlmTtsStreamsTextDelta(t *testing.T) {
 	if !containsEvent(textEvents, "tts.text.delta") || !containsEvent(textEvents, "tts.chat.updated") || !containsEvent(textEvents, "tts.done") {
 		t.Fatalf("unexpected llm events: %#v", textEvents)
 	}
+	if runnerClient.lastAgentKey != "demo" {
+		t.Fatalf("unexpected runner agent key: %q", runnerClient.lastAgentKey)
+	}
+}
+
+func TestLlmTtsRequiresAgentKeyWhenNoDefaultConfigured(t *testing.T) {
+	app, gateway, runnerClient, ttsClient := testDependencies()
+	app.Tts.Llm.Runner.AgentKey = ""
+	handler := NewHandler(app, gateway, tts.NewSynthesisService(app, tts.NewVoiceCatalog(app), ttsClient), runnerClient)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	conn := dialWS(t, server.URL)
+	defer conn.Close()
+	_ = readJSONMessage(t, conn)
+
+	writeJSON(t, conn, map[string]any{
+		"type":   "tts.start",
+		"taskId": "tts-main",
+		"mode":   "llm",
+		"text":   "summarize",
+		"voice":  "Cherry",
+	})
+
+	message := readJSONMessage(t, conn)
+	if message["type"] != "error" {
+		t.Fatalf("expected error event, got %#v", message)
+	}
+	if message["message"] != "tts.start requires agentKey for llm mode" {
+		t.Fatalf("unexpected error message: %#v", message["message"])
+	}
 }
 
 func testDependencies() (*config.App, *fakeGateway, *fakeRunnerClient, *fakeRealtimeTtsClient) {
@@ -408,11 +439,13 @@ func (s *fakeTtsSession) Cancel() {
 }
 
 type fakeRunnerClient struct {
-	events []runner.Event
-	err    error
+	events       []runner.Event
+	err          error
+	lastAgentKey string
 }
 
-func (c *fakeRunnerClient) StreamEvents(_ context.Context, _, _ string) (<-chan runner.Event, <-chan error) {
+func (c *fakeRunnerClient) StreamEvents(_ context.Context, _, _, agentKey string) (<-chan runner.Event, <-chan error) {
+	c.lastAgentKey = agentKey
 	eventCh := make(chan runner.Event, len(c.events))
 	errCh := make(chan error, 1)
 	go func() {

@@ -189,6 +189,7 @@
 - `voice`：音色 ID，默认取默认音色
 - `speechRate`：语速，默认取能力接口返回值
 - `chatId`：QA 模式下用于续接上游 runner 会话
+- `agentKey`：QA 模式下指定本轮问答要路由到的员工；为空时回退服务端默认配置
 
 示例：
 
@@ -199,7 +200,8 @@
   "mode": "local",
   "text": "你好，欢迎使用统一语音服务。",
   "voice": "voice-demo",
-  "speechRate": 1.2
+  "speechRate": 1.2,
+  "agentKey": "demo-agent"
 }
 ```
 

@@ -17,15 +17,20 @@ func TestBuildRequestPayload(t *testing.T) {
 	app.Tts.Llm.Runner.AgentKey = "demo"
 	client := NewHTTPClient(app)
 
-	payload := client.BuildRequestPayload("hello", "chat-1")
+	payload := client.BuildRequestPayload("hello", "chat-1", "agent-dynamic")
 	if payload["message"] != "hello" {
 		t.Fatalf("unexpected message: %#v", payload["message"])
 	}
-	if payload["agentKey"] != "demo" {
+	if payload["agentKey"] != "agent-dynamic" {
 		t.Fatalf("unexpected agentKey: %#v", payload["agentKey"])
 	}
 	if payload["chatId"] != "chat-1" {
 		t.Fatalf("unexpected chatId: %#v", payload["chatId"])
+	}
+
+	fallbackPayload := client.BuildRequestPayload("hello", "chat-1", "")
+	if fallbackPayload["agentKey"] != "demo" {
+		t.Fatalf("unexpected fallback agentKey: %#v", fallbackPayload["agentKey"])
 	}
 }
 
@@ -70,7 +75,7 @@ func TestStreamEvents(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	eventCh, errCh := client.StreamEvents(ctx, "hello", "")
+	eventCh, errCh := client.StreamEvents(ctx, "hello", "", "agent-dynamic")
 	var events []Event
 	for event := range eventCh {
 		events = append(events, event)
@@ -106,7 +111,7 @@ func TestBuildRequestUsesQueryEndpoint(t *testing.T) {
 	app.Tts.Llm.Runner.AgentKey = "demo"
 	client := NewHTTPClient(app)
 
-	req, err := client.buildRequest(context.Background(), "hello", "chat-1")
+	req, err := client.buildRequest(context.Background(), "hello", "chat-1", "agent-dynamic")
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
@@ -136,7 +141,7 @@ func TestStreamEventsErrorIncludesRequestURL(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, errCh := client.StreamEvents(ctx, "hello", "")
+	_, errCh := client.StreamEvents(ctx, "hello", "", "")
 	for err := range errCh {
 		if err == nil {
 			continue

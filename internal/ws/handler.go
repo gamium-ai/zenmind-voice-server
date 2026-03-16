@@ -91,6 +91,7 @@ type clientEvent struct {
 	Text          string          `json:"text"`
 	Voice         string          `json:"voice"`
 	ChatID        string          `json:"chatId"`
+	AgentKey      string          `json:"agentKey"`
 	SpeechRate    *float64        `json:"speechRate"`
 }
 
@@ -237,6 +238,15 @@ func (h *Handler) handleTtsStart(session *sessionContext, event clientEvent) {
 		h.sendError(session, taskID, "config_missing", "Runner SSE is not configured")
 		return
 	}
+	resolvedAgentKey := strings.TrimSpace(event.AgentKey)
+	if resolvedAgentKey == "" {
+		resolvedAgentKey = strings.TrimSpace(h.app.Tts.Llm.Runner.AgentKey)
+	}
+	if mode == "llm" && resolvedAgentKey == "" {
+		session.releaseTaskID(taskID)
+		h.sendError(session, taskID, "bad_request", "tts.start requires agentKey for llm mode")
+		return
+	}
 
 	plan, err := h.ttsService.OpenSession(event.Voice, event.SpeechRate)
 	if err != nil {
@@ -246,11 +256,12 @@ func (h *Handler) handleTtsStart(session *sessionContext, event clientEvent) {
 	}
 
 	task := &ttsTask{
-		taskID: taskID,
-		mode:   mode,
-		text:   text,
-		chatID: strings.TrimSpace(event.ChatID),
-		plan:   plan,
+		taskID:   taskID,
+		mode:     mode,
+		text:     text,
+		chatID:   strings.TrimSpace(event.ChatID),
+		agentKey: resolvedAgentKey,
+		plan:     plan,
 	}
 	session.setTtsTask(taskID, task)
 	h.startTtsTask(session, task)
@@ -334,7 +345,7 @@ func (h *Handler) startTtsTask(session *sessionContext, task *ttsTask) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	task.runnerCancel = cancel
-	eventCh, errCh := h.runner.StreamEvents(ctx, task.text, task.chatID)
+	eventCh, errCh := h.runner.StreamEvents(ctx, task.text, task.chatID, task.agentKey)
 	go func() {
 		for {
 			select {
@@ -761,6 +772,7 @@ type ttsTask struct {
 	mode          string
 	text          string
 	chatID        string
+	agentKey      string
 	plan          tts.SessionPlan
 	stopped       atomic.Bool
 	audioSequence atomic.Int64
