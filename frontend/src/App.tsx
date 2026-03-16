@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type Dispatch, type MutableRefObject, type SetStateAction } from 'react';
 import { PcmQueuePlayer } from './audio/PcmQueuePlayer';
+import { ReadyCuePlayer } from './audio/ReadyCuePlayer';
 import { encodePcm16 } from './audio/pcm';
 import { useVoiceSocket, type ConnectionStatus } from './useVoiceSocket';
 
@@ -248,6 +249,10 @@ function clampQaSendPauseSeconds(seconds: number): number {
   return Math.max(QA_SEND_PAUSE_MIN_SECONDS, Math.min(QA_SEND_PAUSE_MAX_SECONDS, seconds));
 }
 
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function mergeQaUtterance(current: string, next: string): string {
   const left = current.trimEnd();
   const right = next.trimStart();
@@ -308,8 +313,10 @@ export default function App() {
   const [qaMicPaused, setQaMicPaused] = useState(false);
 
   const playerRef = useRef(new PcmQueuePlayer());
+  const readyCuePlayerRef = useRef(new ReadyCuePlayer());
   const pendingBinaryRef = useRef<PendingBinary[]>([]);
   const ttsAudioSummaryRef = useRef<Record<string, TtsAudioSummary>>({});
+  const qaListeningTransitionRef = useRef(0);
 
   const qaSessionActiveRef = useRef(false);
   const qaAwaitingUserRef = useRef(false);
@@ -368,6 +375,10 @@ export default function App() {
     setQaStatus(next);
   }
 
+  function isQaInErrorState() {
+    return qaStatusRef.current === 'ERROR';
+  }
+
   function setQaSessionActiveValue(next: boolean) {
     qaSessionActiveRef.current = next;
     setQaSessionActive(next);
@@ -393,6 +404,11 @@ export default function App() {
 
   function appendQaLog(line: string) {
     appendLog(setQaLogs, line);
+  }
+
+  function cancelQaListeningTransition() {
+    qaListeningTransitionRef.current += 1;
+    readyCuePlayerRef.current.stop();
   }
 
   function resetTtsAudioSummary(taskId: string) {
@@ -505,6 +521,45 @@ export default function App() {
     setQaMicPaused(false);
   }
 
+  async function playQaReadyCue(context: 'initial' | 'resume') {
+    try {
+      await readyCuePlayerRef.current.playReadyCue();
+    } catch (error) {
+      appendQaLog(`[cue ${context}] failed: ${describeError(error)}`);
+    }
+  }
+
+  async function enterQaListeningReady(options: { resumeCapture: boolean }) {
+    const transitionId = qaListeningTransitionRef.current + 1;
+    qaListeningTransitionRef.current = transitionId;
+
+    clearQaPendingUtterance();
+    qaAwaitingUserRef.current = false;
+
+    await playQaReadyCue(options.resumeCapture ? 'resume' : 'initial');
+
+    if (qaListeningTransitionRef.current !== transitionId || !qaSessionActiveRef.current || isQaInErrorState()) {
+      return;
+    }
+
+    const captureReady = options.resumeCapture
+      ? await resumeQaAudioCapture()
+      : await ensureAudioCaptureFor(QA_ASR_TASK_ID, 'qa');
+
+    if (!captureReady) {
+      return;
+    }
+
+    if (qaListeningTransitionRef.current !== transitionId || !qaSessionActiveRef.current || isQaInErrorState()) {
+      return;
+    }
+
+    clearQaPendingUtterance();
+    qaAwaitingUserRef.current = true;
+    setQaStatusValue('LISTENING');
+    setQaNotice('');
+  }
+
   const { status: connectionStatus, sendJson, reconnect } = useVoiceSocket(wsUrl, {
     onJsonMessage: (rawMessage) => {
       const message = rawMessage as ServerEvent;
@@ -552,15 +607,12 @@ export default function App() {
 
         if (message.type === 'task.started') {
           setQaAsrStatusValue('STREAMING');
-          if (!capturePausedRef.current) {
+          if (qaSessionActiveRef.current && qaStatusRef.current === 'STARTING') {
+            void enterQaListeningReady({ resumeCapture: false });
+          } else if (!capturePausedRef.current) {
             void ensureAudioCaptureFor(QA_ASR_TASK_ID, 'qa');
           } else {
             setQaStatusValue('SPEAKING');
-          }
-          if (qaSessionActiveRef.current && qaStatusRef.current === 'STARTING') {
-            qaAwaitingUserRef.current = true;
-            setQaStatusValue('LISTENING');
-            setQaNotice('');
           }
           return;
         }
@@ -574,6 +626,7 @@ export default function App() {
           return;
         }
         if (message.type === 'error') {
+          cancelQaListeningTransition();
           clearQaPendingUtterance();
           resetQaChatContext();
           setQaError(`${message.code ?? 'ERROR'}: ${message.message ?? 'unknown error'}`);
@@ -587,6 +640,7 @@ export default function App() {
           return;
         }
         if (message.type === 'task.stopped') {
+          cancelQaListeningTransition();
           clearQaPendingUtterance();
           resetQaChatContext();
           if (captureTaskIdRef.current === QA_ASR_TASK_ID) {
@@ -656,6 +710,7 @@ export default function App() {
         }
 
         if (message.type === 'task.started') {
+          cancelQaListeningTransition();
           clearQaPendingUtterance();
           setQaTtsStatusValue('STREAMING');
           pendingBinaryRef.current = [];
@@ -694,6 +749,7 @@ export default function App() {
           return;
         }
         if (message.type === 'error') {
+          cancelQaListeningTransition();
           clearQaPendingUtterance();
           resetQaChatContext();
           setQaError(`${message.code ?? 'ERROR'}: ${message.message ?? 'unknown error'}`);
@@ -709,14 +765,9 @@ export default function App() {
           if (qaTtsStatusRef.current !== 'ERROR') {
             setQaTtsStatusValue('STOPPED');
           }
-          void resumeQaAudioCapture().then(() => {
-            if (!qaSessionActiveRef.current) {
-              return;
-            }
-            qaAwaitingUserRef.current = true;
-            setQaStatusValue('LISTENING');
-            setQaNotice('');
-          });
+          if (qaSessionActiveRef.current) {
+            void enterQaListeningReady({ resumeCapture: true });
+          }
         }
       }
     },
@@ -741,6 +792,7 @@ export default function App() {
       appendQaLog(`connection open: ${wsUrl}`);
     },
     onClose: () => {
+      cancelQaListeningTransition();
       clearQaPendingUtterance();
       resetQaChatContext();
       resetAllAudioCaptureState();
@@ -768,12 +820,18 @@ export default function App() {
     }
   });
 
-  async function ensureAudioCaptureFor(taskId: string, owner: Exclude<CaptureOwner, null>) {
+  async function ensureAudioCaptureFor(taskId: string, owner: Exclude<CaptureOwner, null>): Promise<boolean> {
     if (capturePausedRef.current) {
-      return;
+      return false;
     }
     captureOwnerRef.current = owner;
     captureTaskIdRef.current = taskId;
+
+    if (asrCaptureStartedRef.current) {
+      return true;
+    }
+
+    let started = false;
 
     await initializeAudioCapture(
       asrAudioRefs,
@@ -785,16 +843,12 @@ export default function App() {
         });
       },
       () => {
+        started = true;
         if (owner === 'test') {
           setTestAsrStatusValue('STREAMING');
           return;
         }
         setQaAsrStatusValue('STREAMING');
-        if (qaSessionActiveRef.current && qaStatusRef.current !== 'SPEAKING') {
-          clearQaPendingUtterance();
-          qaAwaitingUserRef.current = true;
-          setQaStatusValue('LISTENING');
-        }
       },
       (message) => {
         if (owner === 'test') {
@@ -810,6 +864,8 @@ export default function App() {
         qaAwaitingUserRef.current = false;
       }
     );
+
+    return started || asrCaptureStartedRef.current;
   }
 
   function pauseQaAudioCapture() {
@@ -821,17 +877,17 @@ export default function App() {
     setQaMicPaused(true);
   }
 
-  async function resumeQaAudioCapture() {
+  async function resumeQaAudioCapture(): Promise<boolean> {
     if (!capturePausedRef.current) {
-      return;
+      return asrCaptureStartedRef.current;
     }
     await playerRef.current.waitForIdle();
     capturePausedRef.current = false;
     setQaMicPaused(false);
     if (!qaSessionActiveRef.current || !isTaskActive(qaAsrStatusRef.current)) {
-      return;
+      return false;
     }
-    await ensureAudioCaptureFor(QA_ASR_TASK_ID, 'qa');
+    return ensureAudioCaptureFor(QA_ASR_TASK_ID, 'qa');
   }
 
   function stopAsrTask(taskId: string) {
@@ -971,10 +1027,14 @@ export default function App() {
       return;
     }
 
+    cancelQaListeningTransition();
     resetQaConversationView();
     resetQaChatContext();
     qaAcceptChatUpdatesRef.current = true;
     clearQaPendingUtterance();
+    void readyCuePlayerRef.current.prime().catch((error) => {
+      appendQaLog(`[cue prime] failed: ${describeError(error)}`);
+    });
     setQaStatusValue('STARTING');
     setQaSessionActiveValue(true);
     qaAwaitingUserRef.current = false;
@@ -1001,6 +1061,7 @@ export default function App() {
   }
 
   function stopQa() {
+    cancelQaListeningTransition();
     setQaSessionActiveValue(false);
     qaAwaitingUserRef.current = false;
     setQaNotice('');
