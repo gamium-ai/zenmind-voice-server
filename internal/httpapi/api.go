@@ -25,6 +25,7 @@ func (a *API) Register(mux *http.ServeMux) {
 }
 
 func (a *API) capabilities(w http.ResponseWriter, _ *http.Request) {
+	clientGate := a.app.Asr.ClientGate.Normalized()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"websocketPath": "/api/voice/ws",
 		"asr": map[string]any{
@@ -32,6 +33,13 @@ func (a *API) capabilities(w http.ResponseWriter, _ *http.Request) {
 			"defaults": map[string]any{
 				"sampleRate": 16000,
 				"language":   "zh",
+				"clientGate": map[string]any{
+					"enabled":      clientGate.Enabled,
+					"rmsThreshold": clientGate.RMSThreshold,
+					"openHoldMs":   clientGate.OpenHoldMs,
+					"closeHoldMs":  clientGate.CloseHoldMs,
+					"preRollMs":    clientGate.PreRollMs,
+				},
 				"turnDetection": map[string]any{
 					"type":              "server_vad",
 					"threshold":         0,

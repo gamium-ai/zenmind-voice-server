@@ -1,8 +1,10 @@
 package ws
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -96,6 +98,48 @@ func TestQueueAsrEventsBeforeUpstreamReady(t *testing.T) {
 	}
 	if !strings.Contains(payloads[1], `"input_audio_buffer.append"`) {
 		t.Fatalf("unexpected second payload: %s", payloads[1])
+	}
+}
+
+func TestAsrStartAcceptsClientGateWithoutForwardingUpstream(t *testing.T) {
+	app, gateway, runnerClient, ttsClient := testDependencies()
+	handler := NewHandler(app, gateway, tts.NewSynthesisService(app, tts.NewVoiceCatalog(app), ttsClient), runnerClient)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	conn := dialWS(t, server.URL)
+	defer conn.Close()
+	_ = readJSONMessage(t, conn)
+
+	writeJSON(t, conn, map[string]any{
+		"type":       "asr.start",
+		"taskId":     "asr-client-gate",
+		"sampleRate": 16000,
+		"language":   "zh",
+		"clientGate": map[string]any{
+			"enabled":      true,
+			"rmsThreshold": 0.01,
+			"openHoldMs":   120,
+			"closeHoldMs":  480,
+			"preRollMs":    240,
+		},
+	})
+
+	started := readJSONMessage(t, conn)
+	if started["type"] != "task.started" {
+		t.Fatalf("expected task.started, got %#v", started)
+	}
+
+	waitFor(t, time.Second, func() bool {
+		return len(gateway.upstream.sentPayloads()) == 1
+	})
+
+	payload := gateway.upstream.sentPayloads()[0]
+	if strings.Contains(payload, "clientGate") || strings.Contains(payload, "rmsThreshold") {
+		t.Fatalf("expected clientGate to be ignored by upstream payload, got %s", payload)
+	}
+	if !strings.Contains(payload, `"turn_detection"`) {
+		t.Fatalf("expected turn_detection in upstream payload, got %s", payload)
 	}
 }
 
@@ -308,6 +352,201 @@ func TestLlmTtsRequiresAgentKeyWhenNoDefaultConfigured(t *testing.T) {
 	if message["message"] != "tts.start requires agentKey for llm mode" {
 		t.Fatalf("unexpected error message: %#v", message["message"])
 	}
+}
+
+func TestAsrDetailedLogsEnabled(t *testing.T) {
+	app, gateway, runnerClient, ttsClient := testDependencies()
+	app.Asr.WebSocketDetailedLogEnabled = true
+
+	var logBuffer bytes.Buffer
+	restoreLogs := captureStandardLogger(t, &logBuffer)
+	defer restoreLogs()
+
+	handler := NewHandler(app, gateway, tts.NewSynthesisService(app, tts.NewVoiceCatalog(app), ttsClient), runnerClient)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	conn := dialWS(t, server.URL)
+	defer conn.Close()
+	_ = readJSONMessage(t, conn)
+
+	writeJSON(t, conn, map[string]any{
+		"type":       "asr.start",
+		"taskId":     "asr-log",
+		"sampleRate": 16000,
+		"language":   "zh",
+		"turnDetection": map[string]any{
+			"type":              "server_vad",
+			"silenceDurationMs": 500,
+		},
+	})
+
+	started := readJSONMessage(t, conn)
+	if started["type"] != "task.started" {
+		t.Fatalf("expected task.started, got %#v", started)
+	}
+
+	writeJSON(t, conn, map[string]any{
+		"type":   "asr.audio.append",
+		"taskId": "asr-log",
+		"audio":  "AQID",
+	})
+
+	waitFor(t, time.Second, func() bool {
+		return gateway.listener != nil
+	})
+	gateway.listener.OnMessage(`{"type":"response.audio_transcript.done","transcript":"你好世界"}`)
+
+	message := readJSONMessage(t, conn)
+	if message["type"] != "asr.text.final" {
+		t.Fatalf("expected asr.text.final, got %#v", message)
+	}
+
+	writeJSON(t, conn, map[string]any{"type": "asr.stop", "taskId": "asr-log"})
+	for {
+		message = readJSONMessage(t, conn)
+		if message["type"] == "task.stopped" {
+			break
+		}
+	}
+
+	waitFor(t, time.Second, func() bool {
+		logs := logBuffer.String()
+		return strings.Contains(logs, `vbd c=asr`) &&
+			strings.Contains(logs, `ev=st`) &&
+			strings.Contains(logs, `ab=3`) &&
+			strings.Contains(logs, `ev=fin`) &&
+			strings.Contains(logs, `txt="你好世界"`) &&
+			!strings.Contains(logs, `sid=ws-session-`)
+	})
+	_ = conn.Close()
+	server.Close()
+	time.Sleep(50 * time.Millisecond)
+}
+
+func TestAsrDetailedLogsDisabled(t *testing.T) {
+	app, gateway, runnerClient, ttsClient := testDependencies()
+
+	var logBuffer bytes.Buffer
+	restoreLogs := captureStandardLogger(t, &logBuffer)
+	defer restoreLogs()
+
+	handler := NewHandler(app, gateway, tts.NewSynthesisService(app, tts.NewVoiceCatalog(app), ttsClient), runnerClient)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	conn := dialWS(t, server.URL)
+	defer conn.Close()
+	_ = readJSONMessage(t, conn)
+
+	writeJSON(t, conn, map[string]any{"type": "asr.start", "taskId": "asr-no-log"})
+	_ = readJSONMessage(t, conn)
+	writeJSON(t, conn, map[string]any{"type": "asr.audio.append", "taskId": "asr-no-log", "audio": "AQID"})
+
+	waitFor(t, time.Second, func() bool {
+		return gateway.listener != nil
+	})
+	gateway.listener.OnMessage(`{"type":"response.audio_transcript.done","transcript":"不会记录"}`)
+	_ = readJSONMessage(t, conn)
+
+	time.Sleep(100 * time.Millisecond)
+	logs := logBuffer.String()
+	if strings.Contains(logs, `vbd c=asr`) ||
+		strings.Contains(logs, `ev=st`) ||
+		strings.Contains(logs, `ev=app`) ||
+		strings.Contains(logs, `ev=fin`) {
+		t.Fatalf("expected no ASR detail logs, got %s", logBuffer.String())
+	}
+	_ = conn.Close()
+	server.Close()
+	time.Sleep(50 * time.Millisecond)
+}
+
+func TestLocalTtsDetailedLogsEnabled(t *testing.T) {
+	app, gateway, runnerClient, ttsClient := testDependencies()
+	app.Tts.WebSocketDetailedLogEnabled = true
+
+	var logBuffer bytes.Buffer
+	restoreLogs := captureStandardLogger(t, &logBuffer)
+	defer restoreLogs()
+
+	handler := NewHandler(app, gateway, tts.NewSynthesisService(app, tts.NewVoiceCatalog(app), ttsClient), runnerClient)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	conn := dialWS(t, server.URL)
+	defer conn.Close()
+	_ = readJSONMessage(t, conn)
+
+	writeJSON(t, conn, map[string]any{
+		"type":       "tts.start",
+		"taskId":     "tts-local-log",
+		"mode":       "local",
+		"text":       "hello log",
+		"voice":      "Cherry",
+		"speechRate": 1.5,
+	})
+
+	readUntilTaskStopped(t, conn)
+
+	waitFor(t, time.Second, func() bool {
+		logs := logBuffer.String()
+		return strings.Contains(logs, `vbd c=tts`) &&
+			strings.Contains(logs, `ev=st m=local v=Cherry sr=1.5 txt="hello log"`) &&
+			strings.Contains(logs, `ev=fmt sr=24000 ch=1 v=Cherry`) &&
+			!strings.Contains(logs, `vd=`) &&
+			strings.Contains(logs, `ev=chk seq=1 ab=4`) &&
+			strings.Contains(logs, `ev=done`) &&
+			!strings.Contains(logs, `cid=`) &&
+			!strings.Contains(logs, `ak=`) &&
+			!strings.Contains(logs, `sid=ws-session-`)
+	})
+	_ = conn.Close()
+	server.Close()
+	time.Sleep(50 * time.Millisecond)
+}
+
+func TestLlmTtsDetailedLogsEnabled(t *testing.T) {
+	app, gateway, runnerClient, ttsClient := testDependencies()
+	app.Tts.WebSocketDetailedLogEnabled = true
+	runnerClient.events = []runner.Event{
+		{Type: "chat.updated", ChatID: "chat-log"},
+		{Type: "content.delta", Delta: "你好"},
+	}
+
+	var logBuffer bytes.Buffer
+	restoreLogs := captureStandardLogger(t, &logBuffer)
+	defer restoreLogs()
+
+	handler := NewHandler(app, gateway, tts.NewSynthesisService(app, tts.NewVoiceCatalog(app), ttsClient), runnerClient)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	conn := dialWS(t, server.URL)
+	defer conn.Close()
+	_ = readJSONMessage(t, conn)
+
+	writeJSON(t, conn, map[string]any{
+		"type":   "tts.start",
+		"taskId": "tts-llm-log",
+		"mode":   "llm",
+		"text":   "summarize",
+		"voice":  "Cherry",
+	})
+
+	readUntilTaskStopped(t, conn)
+
+	waitFor(t, time.Second, func() bool {
+		logs := logBuffer.String()
+		return strings.Contains(logs, `vbd c=tts`) &&
+			strings.Contains(logs, `ev=st m=llm v=Cherry sr=1.2 txt=summarize ak=demo`) &&
+			!strings.Contains(logs, `ev=st m=llm v=Cherry sr=1.2 txt=summarize cid=`) &&
+			strings.Contains(logs, `ev=chat cid=chat-log`) &&
+			strings.Contains(logs, `ev=txt txt="你好"`)
+	})
+	_ = conn.Close()
+	server.Close()
+	time.Sleep(50 * time.Millisecond)
 }
 
 func testDependencies() (*config.App, *fakeGateway, *fakeRunnerClient, *fakeRealtimeTtsClient) {
@@ -527,4 +766,42 @@ func waitFor(t *testing.T, timeout time.Duration, check func() bool) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("timed out waiting for condition")
+}
+
+func readUntilTaskStopped(t *testing.T, conn *websocket.Conn) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		messageType, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read message: %v", err)
+		}
+		if messageType == websocket.BinaryMessage {
+			continue
+		}
+		var message map[string]any
+		if err := json.Unmarshal(payload, &message); err != nil {
+			t.Fatalf("decode message: %v", err)
+		}
+		if message["type"] == "task.stopped" {
+			return
+		}
+	}
+	t.Fatal("timed out waiting for task.stopped")
+}
+
+func captureStandardLogger(t *testing.T, buffer *bytes.Buffer) func() {
+	t.Helper()
+	originalWriter := log.Writer()
+	originalFlags := log.Flags()
+	originalPrefix := log.Prefix()
+	log.SetOutput(buffer)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	return func() {
+		log.SetOutput(originalWriter)
+		log.SetFlags(originalFlags)
+		log.SetPrefix(originalPrefix)
+	}
 }

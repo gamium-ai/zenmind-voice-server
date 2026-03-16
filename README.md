@@ -56,6 +56,10 @@ make test
 - 最重要的部署路径约束是 `/api/voice/*`
 - 若由总网关接入，应直接把 `/api/voice/*` 反代到 backend，而不是依赖 console 前端
 - LLM QA 模式支持由客户端在 `tts.start.agentKey` 中动态指定员工；`APP_VOICE_TTS_LLM_RUNNER_AGENT_KEY` 仅作为默认回退。
+- ASR 本地音量门限默认开启，可通过 `APP_VOICE_ASR_CLIENT_GATE_*` 调整浏览器侧 RMS 门限、开门/关门保持时长和预缓冲时长。
+- ASR WebSocket 详细日志开关：`APP_VOICE_ASR_WS_DETAILED_LOG_ENABLED=true|false`
+- TTS WebSocket 详细日志开关：`APP_VOICE_TTS_WS_DETAILED_LOG_ENABLED=true|false`
+- 详细日志默认关闭；开启后会记录文本、任务元数据和音频字节数，但不会打印音频内容或密钥。
 
 ## 4. 部署
 

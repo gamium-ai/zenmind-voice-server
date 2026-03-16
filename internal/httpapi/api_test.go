@@ -32,6 +32,24 @@ func TestCapabilities(t *testing.T) {
 	if payload["websocketPath"] != "/api/voice/ws" {
 		t.Fatalf("unexpected websocket path: %#v", payload["websocketPath"])
 	}
+	asrPayload := payload["asr"].(map[string]any)
+	defaults := asrPayload["defaults"].(map[string]any)
+	clientGate := defaults["clientGate"].(map[string]any)
+	if clientGate["enabled"] != true {
+		t.Fatalf("expected client gate enabled, got %#v", clientGate["enabled"])
+	}
+	if clientGate["rmsThreshold"] != 0.008 {
+		t.Fatalf("unexpected client gate threshold: %#v", clientGate["rmsThreshold"])
+	}
+	if clientGate["openHoldMs"] != float64(120) {
+		t.Fatalf("unexpected client gate openHoldMs: %#v", clientGate["openHoldMs"])
+	}
+	if clientGate["closeHoldMs"] != float64(480) {
+		t.Fatalf("unexpected client gate closeHoldMs: %#v", clientGate["closeHoldMs"])
+	}
+	if clientGate["preRollMs"] != float64(240) {
+		t.Fatalf("unexpected client gate preRollMs: %#v", clientGate["preRollMs"])
+	}
 	ttsPayload := payload["tts"].(map[string]any)
 	if ttsPayload["defaultMode"] != "local" {
 		t.Fatalf("unexpected defaultMode: %#v", ttsPayload["defaultMode"])
@@ -89,6 +107,11 @@ func configTestApp() *config.App {
 		ServerPort: 11953,
 	}
 	app.Asr.Realtime.APIKey = "sk-asr"
+	app.Asr.ClientGate.Enabled = true
+	app.Asr.ClientGate.RMSThreshold = 0.008
+	app.Asr.ClientGate.OpenHoldMs = 120
+	app.Asr.ClientGate.CloseHoldMs = 480
+	app.Asr.ClientGate.PreRollMs = 240
 	app.Tts.DefaultMode = "local"
 	app.Tts.Local.APIKey = "sk-tts"
 	app.Tts.Local.ResponseFormat = "pcm"

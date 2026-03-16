@@ -36,6 +36,22 @@ type ServerEvent = {
   byteLength?: number;
 };
 
+type ClientGateSettings = {
+  enabled?: boolean;
+  rmsThreshold?: number;
+  openHoldMs?: number;
+  closeHoldMs?: number;
+  preRollMs?: number;
+};
+
+type ClientGateConfig = {
+  enabled: boolean;
+  rmsThreshold: number;
+  openHoldMs: number;
+  closeHoldMs: number;
+  preRollMs: number;
+};
+
 type CapabilitiesResponse = {
   websocketPath?: string;
   asr?: {
@@ -43,6 +59,7 @@ type CapabilitiesResponse = {
     defaults?: {
       sampleRate?: number;
       language?: string;
+      clientGate?: ClientGateSettings;
       turnDetection?: {
         type?: string;
         threshold?: number;
@@ -69,6 +86,7 @@ type AudioCaptureRefs = {
   processorRef: MutableRefObject<ScriptProcessorNode | null>;
   captureStartedRef: MutableRefObject<boolean>;
   remainRef: MutableRefObject<Uint8Array>;
+  gateStateRef: MutableRefObject<ClientGateRuntime>;
 };
 
 type PendingBinary = {
@@ -84,13 +102,30 @@ type TtsAudioSummary = {
 };
 
 const FRAME_BYTES = 640;
+const PCM16_BYTES_PER_MS = 32;
 const QA_SEND_PAUSE_DEFAULT_SECONDS = 1.5;
 const QA_SEND_PAUSE_MIN_SECONDS = 0.5;
 const QA_SEND_PAUSE_MAX_SECONDS = 10.0;
+const DEFAULT_CLIENT_GATE: ClientGateConfig = {
+  enabled: true,
+  rmsThreshold: 0.008,
+  openHoldMs: 120,
+  closeHoldMs: 480,
+  preRollMs: 240
+};
 const TEST_ASR_TASK_ID = 'asr-test';
 const TEST_TTS_TASK_ID = 'tts-test';
 const QA_ASR_TASK_ID = 'qa-asr';
 const QA_TTS_TASK_ID = 'qa-tts';
+
+type ClientGateRuntime = {
+  config: ClientGateConfig;
+  isOpen: boolean;
+  openAccumulatedMs: number;
+  closeAccumulatedMs: number;
+  preRollChunks: Uint8Array[];
+  preRollBytes: number;
+};
 
 function isLocalDevHost(hostname: string): boolean {
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
@@ -119,6 +154,150 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
+function normalizeClientGateConfig(settings?: ClientGateSettings): ClientGateConfig {
+  const next = settings ?? {};
+  const rmsThreshold =
+    typeof next.rmsThreshold === 'number' && Number.isFinite(next.rmsThreshold) && next.rmsThreshold >= 0
+      ? next.rmsThreshold
+      : DEFAULT_CLIENT_GATE.rmsThreshold;
+  const openHoldMs =
+    typeof next.openHoldMs === 'number' && Number.isFinite(next.openHoldMs) && next.openHoldMs >= 0
+      ? next.openHoldMs
+      : DEFAULT_CLIENT_GATE.openHoldMs;
+  const closeHoldMs =
+    typeof next.closeHoldMs === 'number' && Number.isFinite(next.closeHoldMs) && next.closeHoldMs >= 0
+      ? next.closeHoldMs
+      : DEFAULT_CLIENT_GATE.closeHoldMs;
+  const preRollMs =
+    typeof next.preRollMs === 'number' && Number.isFinite(next.preRollMs) && next.preRollMs >= 0
+      ? next.preRollMs
+      : DEFAULT_CLIENT_GATE.preRollMs;
+
+  return {
+    enabled: next.enabled ?? DEFAULT_CLIENT_GATE.enabled,
+    rmsThreshold,
+    openHoldMs,
+    closeHoldMs,
+    preRollMs
+  };
+}
+
+function createClientGateRuntime(config: ClientGateConfig): ClientGateRuntime {
+  return {
+    config,
+    isOpen: false,
+    openAccumulatedMs: 0,
+    closeAccumulatedMs: 0,
+    preRollChunks: [],
+    preRollBytes: 0
+  };
+}
+
+function resetClientGateRuntime(runtime: ClientGateRuntime, config?: ClientGateConfig) {
+  runtime.config = config ?? runtime.config;
+  runtime.isOpen = false;
+  runtime.openAccumulatedMs = 0;
+  runtime.closeAccumulatedMs = 0;
+  runtime.preRollChunks = [];
+  runtime.preRollBytes = 0;
+}
+
+function calculateRms(samples: Float32Array): number {
+  if (samples.length === 0) {
+    return 0;
+  }
+
+  let sum = 0;
+  for (let i = 0; i < samples.length; i += 1) {
+    sum += samples[i] * samples[i];
+  }
+  return Math.sqrt(sum / samples.length);
+}
+
+function bufferClientGatePreRoll(runtime: ClientGateRuntime, bytes: Uint8Array) {
+  if (runtime.config.preRollMs <= 0 || bytes.length === 0) {
+    runtime.preRollChunks = [];
+    runtime.preRollBytes = 0;
+    return;
+  }
+
+  runtime.preRollChunks.push(bytes);
+  runtime.preRollBytes += bytes.length;
+
+  const maxBytes = Math.max(0, Math.floor(runtime.config.preRollMs * PCM16_BYTES_PER_MS));
+  while (runtime.preRollBytes > maxBytes && runtime.preRollChunks.length > 0) {
+    const first = runtime.preRollChunks[0];
+    const overflow = runtime.preRollBytes - maxBytes;
+    if (first.length <= overflow) {
+      runtime.preRollChunks.shift();
+      runtime.preRollBytes -= first.length;
+      continue;
+    }
+    runtime.preRollChunks[0] = first.slice(overflow);
+    runtime.preRollBytes -= overflow;
+  }
+}
+
+function flushClientGatePreRoll(
+  runtime: ClientGateRuntime,
+  remainRef: MutableRefObject<Uint8Array>,
+  onChunk: (chunk: Uint8Array) => void
+) {
+  for (const chunk of runtime.preRollChunks) {
+    emitChunkedAudio(chunk, remainRef, onChunk);
+  }
+  runtime.preRollChunks = [];
+  runtime.preRollBytes = 0;
+}
+
+function handleCapturedPcm(
+  refs: AudioCaptureRefs,
+  input: Float32Array,
+  bytes: Uint8Array,
+  onChunk: (chunk: Uint8Array) => void
+) {
+  const runtime = refs.gateStateRef.current;
+  if (!runtime.config.enabled) {
+    emitChunkedAudio(bytes, refs.remainRef, onChunk);
+    return;
+  }
+
+  const frameDurationMs = bytes.length / PCM16_BYTES_PER_MS;
+  if (frameDurationMs <= 0) {
+    return;
+  }
+
+  const aboveThreshold = calculateRms(input) >= runtime.config.rmsThreshold;
+
+  if (!runtime.isOpen) {
+    bufferClientGatePreRoll(runtime, bytes);
+    runtime.closeAccumulatedMs = 0;
+    runtime.openAccumulatedMs = aboveThreshold ? runtime.openAccumulatedMs + frameDurationMs : 0;
+    if (!aboveThreshold || runtime.openAccumulatedMs < runtime.config.openHoldMs) {
+      return;
+    }
+    runtime.isOpen = true;
+    runtime.openAccumulatedMs = 0;
+    flushClientGatePreRoll(runtime, refs.remainRef, onChunk);
+    return;
+  }
+
+  emitChunkedAudio(bytes, refs.remainRef, onChunk);
+  if (aboveThreshold) {
+    runtime.closeAccumulatedMs = 0;
+    return;
+  }
+
+  runtime.closeAccumulatedMs += frameDurationMs;
+  if (runtime.closeAccumulatedMs >= runtime.config.closeHoldMs) {
+    runtime.isOpen = false;
+    runtime.openAccumulatedMs = 0;
+    runtime.closeAccumulatedMs = 0;
+    runtime.preRollChunks = [];
+    runtime.preRollBytes = 0;
+  }
+}
+
 function cleanupAudioCapture(refs: AudioCaptureRefs) {
   refs.captureStartedRef.current = false;
   if (refs.processorRef.current) {
@@ -139,6 +318,7 @@ function cleanupAudioCapture(refs: AudioCaptureRefs) {
     refs.streamRef.current = null;
   }
   refs.remainRef.current = new Uint8Array(0);
+  resetClientGateRuntime(refs.gateStateRef.current);
 }
 
 function emitChunkedAudio(
@@ -194,7 +374,7 @@ async function initializeAudioCapture(
       }
       const input = event.inputBuffer.getChannelData(0);
       const pcm16 = encodePcm16(input, audioContext.sampleRate, 16000);
-      emitChunkedAudio(new Uint8Array(pcm16.buffer), refs.remainRef, onChunk);
+      handleCapturedPcm(refs, input, new Uint8Array(pcm16.buffer), onChunk);
     };
 
     source.connect(processor);
@@ -324,6 +504,7 @@ export default function App() {
   const captureOwnerRef = useRef<CaptureOwner>(null);
   const captureTaskIdRef = useRef<string | null>(null);
   const capturePausedRef = useRef(false);
+  const asrClientGateConfigsRef = useRef<Record<string, ClientGateConfig>>({});
 
   const testAsrStatusRef = useRef<Status>('READY');
   const testTtsStatusRef = useRef<Status>('READY');
@@ -337,6 +518,7 @@ export default function App() {
   const asrProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const asrCaptureStartedRef = useRef(false);
   const asrRemainRef = useRef(new Uint8Array(0));
+  const asrGateStateRef = useRef(createClientGateRuntime(DEFAULT_CLIENT_GATE));
 
   const asrAudioRefs: AudioCaptureRefs = {
     streamRef: asrStreamRef,
@@ -344,10 +526,19 @@ export default function App() {
     sourceRef: asrSourceRef,
     processorRef: asrProcessorRef,
     captureStartedRef: asrCaptureStartedRef,
-    remainRef: asrRemainRef
+    remainRef: asrRemainRef,
+    gateStateRef: asrGateStateRef
   };
 
   const wsUrl = useMemo(() => resolveWsUrl(wsUrlInput), [wsUrlInput]);
+
+  function resolveTaskClientGateConfig(overrides?: ClientGateSettings): ClientGateConfig {
+    const base = normalizeClientGateConfig(capabilities?.asr?.defaults?.clientGate);
+    if (overrides == null) {
+      return base;
+    }
+    return normalizeClientGateConfig({ ...base, ...overrides });
+  }
 
   function setTestAsrStatusValue(next: Status) {
     testAsrStatusRef.current = next;
@@ -533,6 +724,14 @@ export default function App() {
     clearQaPendingUtterance();
     qaAwaitingUserRef.current = false;
 
+    if (options.resumeCapture) {
+      await playerRef.current.waitForIdle();
+    }
+
+    if (qaListeningTransitionRef.current !== transitionId || !qaSessionActiveRef.current || isQaInErrorState()) {
+      return;
+    }
+
     await playQaReadyCue(options.resumeCapture ? 'resume' : 'initial');
 
     if (qaListeningTransitionRef.current !== transitionId || !qaSessionActiveRef.current || isQaInErrorState()) {
@@ -579,6 +778,7 @@ export default function App() {
           return;
         }
         if (message.type === 'error') {
+          delete asrClientGateConfigsRef.current[TEST_ASR_TASK_ID];
           setTestAsrError(`${message.code ?? 'ERROR'}: ${message.message ?? 'unknown error'}`);
           setTestAsrStatusValue('ERROR');
           if (captureTaskIdRef.current === TEST_ASR_TASK_ID) {
@@ -587,6 +787,7 @@ export default function App() {
           return;
         }
         if (message.type === 'task.stopped') {
+          delete asrClientGateConfigsRef.current[TEST_ASR_TASK_ID];
           if (captureTaskIdRef.current === TEST_ASR_TASK_ID) {
             resetAllAudioCaptureState();
           }
@@ -623,6 +824,7 @@ export default function App() {
           return;
         }
         if (message.type === 'error') {
+          delete asrClientGateConfigsRef.current[QA_ASR_TASK_ID];
           cancelQaListeningTransition();
           clearQaPendingUtterance();
           resetQaChatContext();
@@ -637,6 +839,7 @@ export default function App() {
           return;
         }
         if (message.type === 'task.stopped') {
+          delete asrClientGateConfigsRef.current[QA_ASR_TASK_ID];
           cancelQaListeningTransition();
           clearQaPendingUtterance();
           resetQaChatContext();
@@ -793,6 +996,7 @@ export default function App() {
       clearQaPendingUtterance();
       resetQaChatContext();
       resetAllAudioCaptureState();
+      asrClientGateConfigsRef.current = {};
       pendingBinaryRef.current = [];
       playerRef.current.stopAll();
       setQaSessionActiveValue(false);
@@ -823,6 +1027,9 @@ export default function App() {
     }
     captureOwnerRef.current = owner;
     captureTaskIdRef.current = taskId;
+
+    const clientGateConfig = asrClientGateConfigsRef.current[taskId] ?? resolveTaskClientGateConfig();
+    resetClientGateRuntime(asrAudioRefs.gateStateRef.current, clientGateConfig);
 
     if (asrCaptureStartedRef.current) {
       return true;
@@ -878,7 +1085,6 @@ export default function App() {
     if (!capturePausedRef.current) {
       return asrCaptureStartedRef.current;
     }
-    await playerRef.current.waitForIdle();
     capturePausedRef.current = false;
     setQaMicPaused(false);
     if (!qaSessionActiveRef.current || !isTaskActive(qaAsrStatusRef.current)) {
@@ -897,6 +1103,7 @@ export default function App() {
     }
     sendJson({ type: 'asr.audio.commit', taskId });
     sendJson({ type: 'asr.stop', taskId });
+    delete asrClientGateConfigsRef.current[taskId];
     if (captureTaskIdRef.current === taskId) {
       resetAllAudioCaptureState();
     }
@@ -917,11 +1124,14 @@ export default function App() {
     }
 
     setTestAsrStatusValue('CONNECTING');
+    const clientGate = resolveTaskClientGateConfig();
+    asrClientGateConfigsRef.current[TEST_ASR_TASK_ID] = clientGate;
     sendJson({
       type: 'asr.start',
       taskId: TEST_ASR_TASK_ID,
       sampleRate: capabilities?.asr?.defaults?.sampleRate ?? 16000,
       language: capabilities?.asr?.defaults?.language ?? 'zh',
+      clientGate,
       turnDetection: {
         type: capabilities?.asr?.defaults?.turnDetection?.type ?? 'server_vad',
         threshold: capabilities?.asr?.defaults?.turnDetection?.threshold ?? 0,
@@ -1037,12 +1247,15 @@ export default function App() {
     qaAwaitingUserRef.current = false;
     setQaAsrStatusValue('CONNECTING');
     setQaTtsStatusValue('READY');
+    const clientGate = resolveTaskClientGateConfig();
+    asrClientGateConfigsRef.current[QA_ASR_TASK_ID] = clientGate;
 
     const sent = sendJson({
       type: 'asr.start',
       taskId: QA_ASR_TASK_ID,
       sampleRate: capabilities?.asr?.defaults?.sampleRate ?? 16000,
       language: capabilities?.asr?.defaults?.language ?? 'zh',
+      clientGate,
       turnDetection: {
         type: capabilities?.asr?.defaults?.turnDetection?.type ?? 'server_vad',
         threshold: capabilities?.asr?.defaults?.turnDetection?.threshold ?? 0,

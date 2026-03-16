@@ -19,14 +19,25 @@ type App struct {
 }
 
 type AsrProperties struct {
-	Realtime RealtimeProxyProperties
+	ClientGate                  ClientGateProperties
+	Realtime                    RealtimeProxyProperties
+	WebSocketDetailedLogEnabled bool
+}
+
+type ClientGateProperties struct {
+	Enabled      bool
+	RMSThreshold float64
+	OpenHoldMs   int
+	CloseHoldMs  int
+	PreRollMs    int
 }
 
 type TtsProperties struct {
-	DefaultMode string
-	Local       LocalTtsProperties
-	Llm         LlmTtsProperties
-	Voices      VoiceCatalogProperties
+	DefaultMode                 string
+	WebSocketDetailedLogEnabled bool
+	Local                       LocalTtsProperties
+	Llm                         LlmTtsProperties
+	Voices                      VoiceCatalogProperties
 }
 
 type RealtimeProxyProperties struct {
@@ -94,6 +105,13 @@ func defaults() *App {
 	return &App{
 		ServerPort: 11953,
 		Asr: AsrProperties{
+			ClientGate: ClientGateProperties{
+				Enabled:      true,
+				RMSThreshold: 0.008,
+				OpenHoldMs:   120,
+				CloseHoldMs:  480,
+				PreRollMs:    240,
+			},
 			Realtime: RealtimeProxyProperties{
 				ConnectTimeoutMs:       10000,
 				MaxClientEventBytes:    1048576,
@@ -130,8 +148,15 @@ func applyEnv(cfg *App) error {
 	cfg.Asr.Realtime.MaxAppendAudioChars = envInt("APP_VOICE_ASR_REALTIME_MAX_APPEND_AUDIO_CHARS", cfg.Asr.Realtime.MaxAppendAudioChars)
 	cfg.Asr.Realtime.MaxPendingClientEvents = envInt("APP_VOICE_ASR_REALTIME_MAX_PENDING_CLIENT_EVENTS", cfg.Asr.Realtime.MaxPendingClientEvents)
 	cfg.Asr.Realtime.MaxPendingClientBytes = envInt("APP_VOICE_ASR_REALTIME_MAX_PENDING_CLIENT_BYTES", cfg.Asr.Realtime.MaxPendingClientBytes)
+	cfg.Asr.ClientGate.Enabled = envBool("APP_VOICE_ASR_CLIENT_GATE_ENABLED", cfg.Asr.ClientGate.Enabled)
+	cfg.Asr.ClientGate.RMSThreshold = envFloat("APP_VOICE_ASR_CLIENT_GATE_RMS_THRESHOLD", cfg.Asr.ClientGate.RMSThreshold)
+	cfg.Asr.ClientGate.OpenHoldMs = envInt("APP_VOICE_ASR_CLIENT_GATE_OPEN_HOLD_MS", cfg.Asr.ClientGate.OpenHoldMs)
+	cfg.Asr.ClientGate.CloseHoldMs = envInt("APP_VOICE_ASR_CLIENT_GATE_CLOSE_HOLD_MS", cfg.Asr.ClientGate.CloseHoldMs)
+	cfg.Asr.ClientGate.PreRollMs = envInt("APP_VOICE_ASR_CLIENT_GATE_PRE_ROLL_MS", cfg.Asr.ClientGate.PreRollMs)
+	cfg.Asr.WebSocketDetailedLogEnabled = envBool("APP_VOICE_ASR_WS_DETAILED_LOG_ENABLED", cfg.Asr.WebSocketDetailedLogEnabled)
 
 	cfg.Tts.DefaultMode = envString("APP_VOICE_TTS_DEFAULT_MODE", cfg.Tts.DefaultMode)
+	cfg.Tts.WebSocketDetailedLogEnabled = envBool("APP_VOICE_TTS_WS_DETAILED_LOG_ENABLED", cfg.Tts.WebSocketDetailedLogEnabled)
 	cfg.Tts.Local.Endpoint = envString("APP_VOICE_TTS_LOCAL_ENDPOINT", cfg.Tts.Local.Endpoint)
 	cfg.Tts.Local.Model = envString("APP_VOICE_TTS_LOCAL_MODEL", cfg.Tts.Local.Model)
 	cfg.Tts.Local.APIKey = envString("APP_VOICE_TTS_LOCAL_API_KEY", cfg.Tts.Local.APIKey)
@@ -233,6 +258,23 @@ func (c *App) ListenAddr() string {
 
 func (r RealtimeProxyProperties) HasAPIKey() bool {
 	return strings.TrimSpace(r.APIKey) != ""
+}
+
+func (c ClientGateProperties) Normalized() ClientGateProperties {
+	defaults := defaults().Asr.ClientGate
+	if c.RMSThreshold < 0 {
+		c.RMSThreshold = defaults.RMSThreshold
+	}
+	if c.OpenHoldMs < 0 {
+		c.OpenHoldMs = defaults.OpenHoldMs
+	}
+	if c.CloseHoldMs < 0 {
+		c.CloseHoldMs = defaults.CloseHoldMs
+	}
+	if c.PreRollMs < 0 {
+		c.PreRollMs = defaults.PreRollMs
+	}
+	return c
 }
 
 func (l LocalTtsProperties) HasAPIKey() bool {

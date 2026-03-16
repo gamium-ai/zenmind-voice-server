@@ -255,7 +255,7 @@ func (s *dashScopeTtsStreamSession) run() {
 		case "error":
 			code, message := parseRealtimeTTSError(event)
 			if strings.TrimSpace(message) == "" {
-				log.Printf("tts upstream error payload=%q", string(payload))
+				log.Printf("tts upstream error payload_bytes=%d", len(payload))
 				message = "Realtime TTS upstream returned error"
 			} else if strings.TrimSpace(code) != "" {
 				log.Printf("tts upstream error code=%q message=%q", code, message)

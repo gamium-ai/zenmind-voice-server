@@ -8,6 +8,13 @@ import (
 func TestApplyEnvLoadsRequiredVoiceConfig(t *testing.T) {
 	setRequiredEnv(t)
 	t.Setenv("APP_VOICE_TTS_LOCAL_SPEECH_RATE", "1.5")
+	t.Setenv("APP_VOICE_ASR_WS_DETAILED_LOG_ENABLED", "true")
+	t.Setenv("APP_VOICE_TTS_WS_DETAILED_LOG_ENABLED", "true")
+	t.Setenv("APP_VOICE_ASR_CLIENT_GATE_ENABLED", "false")
+	t.Setenv("APP_VOICE_ASR_CLIENT_GATE_RMS_THRESHOLD", "0.012")
+	t.Setenv("APP_VOICE_ASR_CLIENT_GATE_OPEN_HOLD_MS", "150")
+	t.Setenv("APP_VOICE_ASR_CLIENT_GATE_CLOSE_HOLD_MS", "600")
+	t.Setenv("APP_VOICE_ASR_CLIENT_GATE_PRE_ROLL_MS", "180")
 
 	cfg := defaults()
 	if err := applyEnv(cfg); err != nil {
@@ -34,6 +41,58 @@ func TestApplyEnvLoadsRequiredVoiceConfig(t *testing.T) {
 	}
 	if cfg.Tts.Local.SpeechRate != 1.5 {
 		t.Fatalf("unexpected speech rate: %v", cfg.Tts.Local.SpeechRate)
+	}
+	if !cfg.Asr.WebSocketDetailedLogEnabled {
+		t.Fatal("expected ASR websocket detailed log to be enabled")
+	}
+	if !cfg.Tts.WebSocketDetailedLogEnabled {
+		t.Fatal("expected TTS websocket detailed log to be enabled")
+	}
+	if cfg.Asr.ClientGate.Enabled {
+		t.Fatal("expected client gate to be disabled by env override")
+	}
+	if cfg.Asr.ClientGate.RMSThreshold != 0.012 {
+		t.Fatalf("unexpected client gate threshold: %v", cfg.Asr.ClientGate.RMSThreshold)
+	}
+	if cfg.Asr.ClientGate.OpenHoldMs != 150 {
+		t.Fatalf("unexpected client gate open hold: %d", cfg.Asr.ClientGate.OpenHoldMs)
+	}
+	if cfg.Asr.ClientGate.CloseHoldMs != 600 {
+		t.Fatalf("unexpected client gate close hold: %d", cfg.Asr.ClientGate.CloseHoldMs)
+	}
+	if cfg.Asr.ClientGate.PreRollMs != 180 {
+		t.Fatalf("unexpected client gate pre-roll: %d", cfg.Asr.ClientGate.PreRollMs)
+	}
+}
+
+func TestApplyEnvLeavesDetailedLogsDisabledByDefault(t *testing.T) {
+	setRequiredEnv(t)
+
+	cfg := defaults()
+	if err := applyEnv(cfg); err != nil {
+		t.Fatalf("applyEnv: %v", err)
+	}
+
+	if cfg.Asr.WebSocketDetailedLogEnabled {
+		t.Fatal("expected ASR websocket detailed log to default to false")
+	}
+	if cfg.Tts.WebSocketDetailedLogEnabled {
+		t.Fatal("expected TTS websocket detailed log to default to false")
+	}
+	if !cfg.Asr.ClientGate.Enabled {
+		t.Fatal("expected ASR client gate to default to enabled")
+	}
+	if cfg.Asr.ClientGate.RMSThreshold != 0.008 {
+		t.Fatalf("unexpected default client gate threshold: %v", cfg.Asr.ClientGate.RMSThreshold)
+	}
+	if cfg.Asr.ClientGate.OpenHoldMs != 120 {
+		t.Fatalf("unexpected default client gate open hold: %d", cfg.Asr.ClientGate.OpenHoldMs)
+	}
+	if cfg.Asr.ClientGate.CloseHoldMs != 480 {
+		t.Fatalf("unexpected default client gate close hold: %d", cfg.Asr.ClientGate.CloseHoldMs)
+	}
+	if cfg.Asr.ClientGate.PreRollMs != 240 {
+		t.Fatalf("unexpected default client gate pre-roll: %d", cfg.Asr.ClientGate.PreRollMs)
 	}
 }
 

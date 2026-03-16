@@ -28,6 +28,13 @@
     "defaults": {
       "sampleRate": 16000,
       "language": "zh",
+      "clientGate": {
+        "enabled": true,
+        "rmsThreshold": 0.008,
+        "openHoldMs": 120,
+        "closeHoldMs": 480,
+        "preRollMs": 240
+      },
       "turnDetection": {
         "type": "server_vad",
         "threshold": 0,
@@ -125,6 +132,7 @@
 可选字段：
 - `sampleRate`：采样率，默认 `16000`
 - `language`：语言，默认 `zh`
+- `clientGate`：客户端本地音量门限配置，仅影响浏览器侧是否发送 `asr.audio.append`
 - `turnDetection`：服务端 VAD 参数
 
 示例：
@@ -135,6 +143,13 @@
   "taskId": "asr-demo",
   "sampleRate": 16000,
   "language": "zh",
+  "clientGate": {
+    "enabled": true,
+    "rmsThreshold": 0.008,
+    "openHoldMs": 120,
+    "closeHoldMs": 480,
+    "preRollMs": 240
+  },
   "turnDetection": {
     "type": "server_vad",
     "threshold": 0,
@@ -142,6 +157,10 @@
   }
 }
 ```
+
+说明：
+- `clientGate` 是客户端本地门限，用于在轻声或背景杂音时减少发往服务端的音频请求。
+- `turnDetection` 仍会透传给上游 ASR，作为服务端 VAD 兜底；它不会替代 `clientGate` 的本地拦截职责。
 
 失败条件：
 - `taskId` 为空

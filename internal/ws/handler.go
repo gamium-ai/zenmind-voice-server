@@ -1,6 +1,7 @@
 package ws
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,7 +52,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session := newSessionContext(conn)
+	session := newSessionContext(conn, r.RemoteAddr)
+	h.logSessionEvent(session, "connection.open")
 	session.sendJSON(map[string]any{
 		"type":            "connection.ready",
 		"sessionId":       session.sessionID,
@@ -86,6 +89,7 @@ type clientEvent struct {
 	SampleRate    int             `json:"sampleRate"`
 	Language      string          `json:"language"`
 	Audio         string          `json:"audio"`
+	ClientGate    json.RawMessage `json:"clientGate"`
 	TurnDetection json.RawMessage `json:"turnDetection"`
 	Mode          string          `json:"mode"`
 	Text          string          `json:"text"`
@@ -149,6 +153,12 @@ func (h *Handler) handleAsrStart(session *sessionContext, event clientEvent) {
 	}
 	task.turnDetectionPayload = buildAsrSessionUpdatePayload(event.TurnDetection, task.sampleRate, task.language)
 	session.setAsrTask(taskID, task)
+	h.logTaskEvent("asr", session.sessionID, taskID, "asr.start",
+		detailField("sample_rate", task.sampleRate),
+		detailField("language", task.language),
+		detailField("client_gate", compactJSON(event.ClientGate)),
+		detailField("turn_detection", compactJSON(event.TurnDetection)),
+	)
 
 	go h.connectUpstream(session, task)
 }
@@ -164,10 +174,15 @@ func (h *Handler) handleAsrAudioAppend(session *sessionContext, event clientEven
 		h.sendError(session, taskID, "task_not_found", "ASR task is not active")
 		return
 	}
-	audio, ok := h.validateAudioAppend(session, taskID, event, originalPayload)
+	audio, decodedBytes, ok := h.validateAudioAppend(session, taskID, event, originalPayload)
 	if !ok {
 		return
 	}
+	h.logTaskEvent("asr", session.sessionID, taskID, "asr.audio.append",
+		detailField("payload_bytes", len(originalPayload)),
+		detailField("audio_base64_chars", len(audio)),
+		detailField("audio_bytes", decodedBytes),
+	)
 	h.dispatchClientEvent(session, task, queuedEvent{
 		payload:      fmt.Sprintf(`{"type":"input_audio_buffer.append","audio":"%s"}`, audio),
 		payloadBytes: len(originalPayload),
@@ -185,6 +200,7 @@ func (h *Handler) handleAsrAudioCommit(session *sessionContext, event clientEven
 		h.sendError(session, taskID, "task_not_found", "ASR task is not active")
 		return
 	}
+	h.logTaskEvent("asr", session.sessionID, taskID, "asr.audio.commit")
 	h.dispatchClientEvent(session, task, queuedEvent{
 		payload:      `{"type":"input_audio_buffer.commit"}`,
 		payloadBytes: 36,
@@ -202,6 +218,7 @@ func (h *Handler) handleAsrStop(session *sessionContext, event clientEvent) {
 		h.sendError(session, taskID, "task_not_found", "ASR task is not active")
 		return
 	}
+	h.logTaskEvent("asr", session.sessionID, taskID, "asr.stop")
 	h.finishAsrTask(session, task, "client_stop", true, true)
 }
 
@@ -264,6 +281,23 @@ func (h *Handler) handleTtsStart(session *sessionContext, event clientEvent) {
 		plan:     plan,
 	}
 	session.setTtsTask(taskID, task)
+	resolvedSpeechRate := h.app.Tts.Local.SpeechRate
+	if event.SpeechRate != nil {
+		resolvedSpeechRate = *event.SpeechRate
+	}
+	logFields := []string{
+		detailField("mode", mode),
+		detailField("voice", task.plan.VoiceID),
+		detailField("speech_rate", resolvedSpeechRate),
+		detailField("text", task.text),
+	}
+	if task.mode == "llm" {
+		logFields = append(logFields,
+			detailField("chat_id", task.chatID),
+			detailField("agent_key", task.agentKey),
+		)
+	}
+	h.logTaskEvent("tts", session.sessionID, taskID, "tts.start", logFields...)
 	h.startTtsTask(session, task)
 }
 
@@ -278,7 +312,9 @@ func (h *Handler) handleTtsStop(session *sessionContext, event clientEvent) {
 		h.sendError(session, taskID, "task_not_found", "TTS task is not active")
 		return
 	}
+	h.logTaskEvent("tts", session.sessionID, taskID, "tts.stop")
 	session.sendJSON(eventBody("tts.done", session.sessionID, taskID, map[string]any{"reason": "client_stop"}))
+	h.logTaskEvent("tts", session.sessionID, taskID, "tts.done", detailField("reason", "client_stop"))
 	h.finishTtsTask(session, task, "client_stop", true, true)
 }
 
@@ -292,18 +328,22 @@ func (h *Handler) connectUpstream(session *sessionContext, task *asrTask) {
 			if strings.TrimSpace(reason) == "" {
 				reason = "upstream_closed"
 			}
+			h.logTaskEvent("asr", session.sessionID, task.taskID, "upstream.closed", detailField("reason", reason))
 			h.finishAsrTask(session, task, reason, false, true)
 		},
 		onError: func(err error) {
+			h.logTaskEvent("asr", session.sessionID, task.taskID, "upstream.error", detailField("cause", err.Error()))
 			h.sendLoggedError(session, task.taskID, "asr", "upstream_error", "Upstream realtime service error", err, "")
 			h.finishAsrTask(session, task, "upstream_error", false, true)
 		},
 	})
 	if err != nil {
+		h.logTaskEvent("asr", session.sessionID, task.taskID, "upstream.connect_failed", detailField("cause", err.Error()))
 		h.sendLoggedError(session, task.taskID, "asr", "upstream_connect_failed", "Failed to connect upstream realtime service", err, "")
 		h.finishAsrTask(session, task, "connect_failed", false, true)
 		return
 	}
+	h.logTaskEvent("asr", session.sessionID, task.taskID, "upstream.connected")
 
 	task.mu.Lock()
 	if task.stopped.Load() || session.closed.Load() {
@@ -321,6 +361,7 @@ func (h *Handler) connectUpstream(session *sessionContext, task *asrTask) {
 		return
 	}
 	session.sendJSON(eventBody("task.started", session.sessionID, task.taskID, map[string]any{"taskType": "asr"}))
+	h.logTaskEvent("asr", session.sessionID, task.taskID, "task.started")
 	h.flushPendingClientEvents(session, task)
 }
 
@@ -329,12 +370,19 @@ func (h *Handler) startTtsTask(session *sessionContext, task *ttsTask) {
 		"taskType": "tts",
 		"mode":     task.mode,
 	}))
+	h.logTaskEvent("tts", session.sessionID, task.taskID, "task.started")
 	session.sendJSON(eventBody("tts.audio.format", session.sessionID, task.taskID, map[string]any{
 		"sampleRate":       task.plan.SampleRate,
 		"channels":         task.plan.Channels,
 		"voice":            task.plan.VoiceID,
 		"voiceDisplayName": task.plan.VoiceDisplayName,
 	}))
+	h.logTaskEvent("tts", session.sessionID, task.taskID, "tts.audio.format",
+		detailField("sample_rate", task.plan.SampleRate),
+		detailField("channels", task.plan.Channels),
+		detailField("voice", task.plan.VoiceID),
+		detailField("voice_display_name", compactVoiceDisplayName(task.plan.VoiceID, task.plan.VoiceDisplayName)),
+	)
 
 	go h.streamTtsAudio(session, task)
 	if task.mode == "local" {
@@ -354,6 +402,7 @@ func (h *Handler) startTtsTask(session *sessionContext, task *ttsTask) {
 					eventCh = nil
 					if !task.hasContent.Load() {
 						session.sendJSON(eventBody("tts.done", session.sessionID, task.taskID, map[string]any{"reason": "no_content"}))
+						h.logTaskEvent("tts", session.sessionID, task.taskID, "tts.done", detailField("reason", "no_content"))
 						h.finishTtsTask(session, task, "no_content", true, true)
 						return
 					}
@@ -365,6 +414,7 @@ func (h *Handler) startTtsTask(session *sessionContext, task *ttsTask) {
 					session.sendJSON(eventBody("tts.chat.updated", session.sessionID, task.taskID, map[string]any{
 						"chatId": event.ChatID,
 					}))
+					h.logTaskEvent("tts", session.sessionID, task.taskID, "tts.chat.updated", detailField("chat_id", event.ChatID))
 					continue
 				}
 				if !event.IsContentDelta() || strings.TrimSpace(event.Delta) == "" {
@@ -374,6 +424,7 @@ func (h *Handler) startTtsTask(session *sessionContext, task *ttsTask) {
 				session.sendJSON(eventBody("tts.text.delta", session.sessionID, task.taskID, map[string]any{
 					"text": event.Delta,
 				}))
+				h.logTaskEvent("tts", session.sessionID, task.taskID, "tts.text.delta", detailField("text", event.Delta))
 				task.plan.Session.AppendText(event.Delta)
 			case err, ok := <-errCh:
 				if !ok {
@@ -406,6 +457,10 @@ func (h *Handler) streamTtsAudio(session *sessionContext, task *ttsTask) {
 				continue
 			}
 			seq := task.audioSequence.Add(1)
+			h.logTaskEvent("tts", session.sessionID, task.taskID, "tts.audio.chunk",
+				detailField("seq", seq),
+				detailField("audio_bytes", len(chunk.PCM16LE)),
+			)
 			session.sendTtsChunkPair(task.taskID, int(seq), chunk)
 		case err, ok := <-errCh:
 			if !ok {
@@ -423,6 +478,7 @@ func (h *Handler) streamTtsAudio(session *sessionContext, task *ttsTask) {
 				return
 			}
 			session.sendJSON(eventBody("tts.done", session.sessionID, task.taskID, map[string]any{"reason": "completed"}))
+			h.logTaskEvent("tts", session.sessionID, task.taskID, "tts.done", detailField("reason", "completed"))
 			h.finishTtsTask(session, task, "completed", false, true)
 			return
 		}
@@ -451,6 +507,10 @@ func (h *Handler) forwardNormalizedAsrEvent(session *sessionContext, task *asrTa
 		if message == "" {
 			message = "Upstream error"
 		}
+		h.logTaskEvent("asr", session.sessionID, task.taskID, "upstream.error",
+			detailField("code", code),
+			detailField("message", message),
+		)
 		h.sendLoggedError(session, task.taskID, "asr", code, message, nil, payload)
 		h.finishAsrTask(session, task, code, false, true)
 		return
@@ -461,43 +521,53 @@ func (h *Handler) forwardNormalizedAsrEvent(session *sessionContext, task *asrTa
 			"text":         deltaText,
 			"upstreamType": eventType,
 		}))
+		h.logTaskEvent("asr", session.sessionID, task.taskID, "asr.text.delta",
+			detailField("text", deltaText),
+			detailField("upstream_type", eventType),
+		)
 	}
 	if finalText := extractFinalText(event); strings.TrimSpace(finalText) != "" {
 		session.sendJSON(eventBody("asr.text.final", session.sessionID, task.taskID, map[string]any{
 			"text":         finalText,
 			"upstreamType": eventType,
 		}))
+		h.logTaskEvent("asr", session.sessionID, task.taskID, "asr.text.final",
+			detailField("text", finalText),
+			detailField("upstream_type", eventType),
+		)
 	}
 	if eventType == "input_audio_buffer.speech_started" {
 		session.sendJSON(eventBody("asr.speech.started", session.sessionID, task.taskID, map[string]any{
 			"upstreamType": eventType,
 		}))
+		h.logTaskEvent("asr", session.sessionID, task.taskID, "asr.speech.started", detailField("upstream_type", eventType))
 	}
 	if eventType == "session.finished" {
 		h.finishAsrTask(session, task, "upstream_finished", false, true)
 	}
 }
 
-func (h *Handler) validateAudioAppend(session *sessionContext, taskID string, event clientEvent, originalPayload []byte) (string, bool) {
+func (h *Handler) validateAudioAppend(session *sessionContext, taskID string, event clientEvent, originalPayload []byte) (string, int, bool) {
 	realtime := h.app.Asr.Realtime
 	if len(originalPayload) > realtime.MaxClientEventBytes {
 		h.sendError(session, taskID, "event_too_large", "Client event exceeds maximum size")
-		return "", false
+		return "", 0, false
 	}
 	audio := strings.TrimSpace(event.Audio)
 	if audio == "" {
 		h.sendError(session, taskID, "bad_request", "audio.append requires non-empty string field 'audio'")
-		return "", false
+		return "", 0, false
 	}
 	if len(audio) > realtime.MaxAppendAudioChars {
 		h.sendError(session, taskID, "audio_too_large", "Audio payload exceeds maximum size")
-		return "", false
+		return "", 0, false
 	}
-	if _, err := base64.StdEncoding.DecodeString(audio); err != nil {
+	decoded, err := base64.StdEncoding.DecodeString(audio)
+	if err != nil {
 		h.sendError(session, taskID, "bad_request", "audio must be valid base64 pcm16le")
-		return "", false
+		return "", 0, false
 	}
-	return audio, true
+	return audio, len(decoded), true
 }
 
 func (h *Handler) dispatchClientEvent(session *sessionContext, task *asrTask, event queuedEvent) {
@@ -573,6 +643,7 @@ func (h *Handler) finishAsrTask(session *sessionContext, task *asrTask, reason s
 			"reason":   reason,
 		}))
 	}
+	h.logTaskEvent("asr", session.sessionID, task.taskID, "task.stopped", detailField("reason", reason))
 }
 
 func (h *Handler) finishTtsTask(session *sessionContext, task *ttsTask, reason string, cancelSession bool, notify bool) {
@@ -593,12 +664,14 @@ func (h *Handler) finishTtsTask(session *sessionContext, task *ttsTask, reason s
 			"reason":   reason,
 		}))
 	}
+	h.logTaskEvent("tts", session.sessionID, task.taskID, "task.stopped", detailField("reason", reason))
 }
 
 func (h *Handler) cleanup(session *sessionContext, notify bool) {
 	if !session.closed.CompareAndSwap(false, true) {
 		return
 	}
+	h.logSessionEvent(session, "connection.closed")
 	for _, task := range session.listAsrTasks() {
 		h.finishAsrTask(session, task, "connection_closed", true, notify)
 	}
@@ -616,41 +689,72 @@ func (h *Handler) sendError(session *sessionContext, taskID, code, message strin
 }
 
 func (h *Handler) sendLoggedError(session *sessionContext, taskID, taskType, code, message string, cause error, upstreamPayload string) {
-	logParts := []string{
-		fmt.Sprintf("session_id=%q", session.sessionID),
-		fmt.Sprintf("task_id=%q", taskID),
-		fmt.Sprintf("task_type=%q", taskType),
-		fmt.Sprintf("code=%q", code),
-		fmt.Sprintf("message=%q", message),
-	}
-	if cause != nil {
-		logParts = append(logParts, fmt.Sprintf("cause=%q", cause.Error()))
-	}
-	if strings.TrimSpace(upstreamPayload) != "" {
-		logParts = append(logParts, fmt.Sprintf("upstream_payload=%q", upstreamPayload))
-	}
-	log.Printf("voice backend error %s", strings.Join(logParts, " "))
+	log.Printf("vbe %s", strings.Join(compactErrorParts(taskType, session.sessionID, taskID, code, message, cause, upstreamPayload), " "))
 	h.sendError(session, taskID, code, message)
 }
 
-type sessionContext struct {
-	conn      *websocket.Conn
-	sessionID string
-	writeMu   sync.Mutex
-	taskMu    sync.Mutex
-	taskIDs   map[string]struct{}
-	asrTasks  map[string]*asrTask
-	ttsTasks  map[string]*ttsTask
-	closed    atomic.Bool
+func (h *Handler) logSessionEvent(session *sessionContext, event string, fields ...string) {
+	baseFields := append([]string{detailField("remote_addr", session.remoteAddr)}, fields...)
+	if h.app.Asr.WebSocketDetailedLogEnabled {
+		h.logTaskEvent("asr", session.sessionID, "", event, baseFields...)
+	}
+	if h.app.Tts.WebSocketDetailedLogEnabled {
+		h.logTaskEvent("tts", session.sessionID, "", event, baseFields...)
+	}
 }
 
-func newSessionContext(conn *websocket.Conn) *sessionContext {
+func (h *Handler) logTaskEvent(taskType, sessionID, taskID, event string, fields ...string) {
+	if !h.shouldLogDetailed(taskType) {
+		return
+	}
+	parts := []string{
+		detailField("component", taskType),
+		detailField("session_id", sessionID),
+		detailField("task_id", taskID),
+		detailField("event", event),
+	}
+	parts = append(parts, fields...)
+	filtered := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if strings.TrimSpace(part) == "" {
+			continue
+		}
+		filtered = append(filtered, part)
+	}
+	log.Printf("vbd %s", strings.Join(filtered, " "))
+}
+
+func (h *Handler) shouldLogDetailed(taskType string) bool {
+	switch taskType {
+	case "asr":
+		return h.app.Asr.WebSocketDetailedLogEnabled
+	case "tts":
+		return h.app.Tts.WebSocketDetailedLogEnabled
+	default:
+		return false
+	}
+}
+
+type sessionContext struct {
+	conn       *websocket.Conn
+	sessionID  string
+	remoteAddr string
+	writeMu    sync.Mutex
+	taskMu     sync.Mutex
+	taskIDs    map[string]struct{}
+	asrTasks   map[string]*asrTask
+	ttsTasks   map[string]*ttsTask
+	closed     atomic.Bool
+}
+
+func newSessionContext(conn *websocket.Conn, remoteAddr string) *sessionContext {
 	return &sessionContext{
-		conn:      conn,
-		sessionID: fmt.Sprintf("ws-session-%d", time.Now().UnixNano()),
-		taskIDs:   make(map[string]struct{}),
-		asrTasks:  make(map[string]*asrTask),
-		ttsTasks:  make(map[string]*ttsTask),
+		conn:       conn,
+		sessionID:  fmt.Sprintf("ws-session-%d", time.Now().UnixNano()),
+		remoteAddr: strings.TrimSpace(remoteAddr),
+		taskIDs:    make(map[string]struct{}),
+		asrTasks:   make(map[string]*asrTask),
+		ttsTasks:   make(map[string]*ttsTask),
 	}
 }
 
@@ -969,6 +1073,224 @@ func defaultString(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func compactJSON(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var buffer bytes.Buffer
+	if err := json.Compact(&buffer, raw); err == nil {
+		return buffer.String()
+	}
+	return strings.TrimSpace(string(raw))
+}
+
+func compactVoiceDisplayName(voiceID, displayName string) string {
+	if strings.EqualFold(strings.TrimSpace(voiceID), strings.TrimSpace(displayName)) {
+		return ""
+	}
+	return displayName
+}
+
+func detailField(key string, value any) string {
+	compactKey := compactFieldKey(key)
+	if compactKey == "" {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		normalized := normalizeFieldValue(key, typed)
+		if normalized == "" {
+			return ""
+		}
+		return fmt.Sprintf("%s=%s", compactKey, formatCompactString(normalized))
+	case int:
+		return fmt.Sprintf("%s=%d", compactKey, typed)
+	case int64:
+		return fmt.Sprintf("%s=%d", compactKey, typed)
+	case float64:
+		return fmt.Sprintf("%s=%g", compactKey, typed)
+	case bool:
+		return fmt.Sprintf("%s=%t", compactKey, typed)
+	default:
+		return fmt.Sprintf("%s=%v", compactKey, typed)
+	}
+}
+
+func compactFieldKey(key string) string {
+	switch key {
+	case "component":
+		return "c"
+	case "session_id":
+		return "sid"
+	case "task_id":
+		return "tid"
+	case "event":
+		return "ev"
+	case "mode":
+		return "m"
+	case "voice":
+		return "v"
+	case "voice_display_name":
+		return "vd"
+	case "speech_rate", "sample_rate":
+		return "sr"
+	case "channels":
+		return "ch"
+	case "text":
+		return "txt"
+	case "chat_id":
+		return "cid"
+	case "agent_key":
+		return "ak"
+	case "seq":
+		return "seq"
+	case "audio_bytes":
+		return "ab"
+	case "payload_bytes":
+		return "pb"
+	case "audio_base64_chars":
+		return "b64"
+	case "language":
+		return "lang"
+	case "turn_detection":
+		return "td"
+	case "upstream_type":
+		return "ut"
+	case "reason":
+		return "rsn"
+	case "code":
+		return "cd"
+	case "message":
+		return "msg"
+	case "cause":
+		return "cause"
+	case "upstream_payload_bytes":
+		return "upb"
+	case "remote_addr":
+		return "ra"
+	default:
+		return key
+	}
+}
+
+func normalizeFieldValue(key, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	switch key {
+	case "session_id":
+		return strings.TrimPrefix(value, "ws-session-")
+	case "event":
+		return compactEventCode(value)
+	default:
+		return value
+	}
+}
+
+func compactEventCode(event string) string {
+	switch event {
+	case "connection.open":
+		return "co"
+	case "connection.closed":
+		return "cc"
+	case "tts.start":
+		return "st"
+	case "tts.start.meta":
+		return "meta"
+	case "task.started":
+		return "ts"
+	case "tts.audio.format":
+		return "fmt"
+	case "tts.text.delta":
+		return "txt"
+	case "tts.chat.updated":
+		return "chat"
+	case "tts.audio.chunk":
+		return "chk"
+	case "tts.done":
+		return "done"
+	case "tts.stop":
+		return "stop"
+	case "task.stopped":
+		return "te"
+	case "asr.start":
+		return "st"
+	case "asr.audio.append":
+		return "app"
+	case "asr.audio.commit":
+		return "cmt"
+	case "asr.text.delta":
+		return "txt"
+	case "asr.text.final":
+		return "fin"
+	case "asr.speech.started":
+		return "sp"
+	case "asr.stop":
+		return "stop"
+	case "upstream.connected":
+		return "up"
+	case "upstream.closed":
+		return "upc"
+	case "upstream.error", "upstream.connect_failed":
+		return "upe"
+	case "error":
+		return "err"
+	default:
+		return event
+	}
+}
+
+func formatCompactString(value string) string {
+	if isCompactToken(value) {
+		return value
+	}
+	return strconv.Quote(value)
+}
+
+func isCompactToken(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			continue
+		}
+		switch r {
+		case '.', '-', '_', ':', '/':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func compactErrorParts(taskType, sessionID, taskID, code, message string, cause error, upstreamPayload string) []string {
+	parts := []string{
+		detailField("component", taskType),
+		detailField("session_id", sessionID),
+		detailField("task_id", taskID),
+		detailField("event", "error"),
+		detailField("code", code),
+		detailField("message", message),
+	}
+	if cause != nil {
+		parts = append(parts, detailField("cause", cause.Error()))
+	}
+	if strings.TrimSpace(upstreamPayload) != "" {
+		parts = append(parts, detailField("upstream_payload_bytes", len(upstreamPayload)))
+	}
+	filtered := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if strings.TrimSpace(part) == "" {
+			continue
+		}
+		filtered = append(filtered, part)
+	}
+	return filtered
 }
 
 func classifyTransportError(err error) int {
