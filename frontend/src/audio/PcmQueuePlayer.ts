@@ -55,16 +55,20 @@ export class PcmQueuePlayer {
   }
 
   async waitForIdle(): Promise<void> {
-    const ctx = this.audioContext;
-    if (ctx == null || this.nextPlayTime <= 0) {
-      return;
-    }
+    while (true) {
+      const ctx = this.audioContext;
+      if (ctx == null) {
+        return;
+      }
 
-    const remainingMs = Math.max(0, (this.nextPlayTime - ctx.currentTime) * 1000);
-    if (remainingMs <= 0) {
-      return;
+      const remainingMs = Math.max(0, (this.nextPlayTime - ctx.currentTime) * 1000);
+      if (remainingMs <= 0 && this.activeSources.size === 0) {
+        return;
+      }
+
+      const waitMs = remainingMs > 0 ? Math.max(remainingMs, 10) : 10;
+      await new Promise((resolve) => window.setTimeout(resolve, waitMs));
     }
-    await new Promise((resolve) => window.setTimeout(resolve, remainingMs));
   }
 
   resetQueue(): void {

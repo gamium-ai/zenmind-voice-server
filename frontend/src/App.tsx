@@ -106,6 +106,7 @@ const PCM16_BYTES_PER_MS = 32;
 const QA_SEND_PAUSE_DEFAULT_SECONDS = 1.5;
 const QA_SEND_PAUSE_MIN_SECONDS = 0.5;
 const QA_SEND_PAUSE_MAX_SECONDS = 10.0;
+const QA_READY_CUE_DELAY_MS = 300;
 const DEFAULT_CLIENT_GATE: ClientGateConfig = {
   enabled: true,
   rmsThreshold: 0.008,
@@ -494,6 +495,10 @@ export default function App() {
   const pendingBinaryRef = useRef<PendingBinary[]>([]);
   const ttsAudioSummaryRef = useRef<Record<string, TtsAudioSummary>>({});
   const qaListeningTransitionRef = useRef(0);
+  const qaPendingPlaybackChunksRef = useRef(0);
+  const qaResumeAfterPlaybackPendingRef = useRef(false);
+  const qaReadyCueDelayTimerRef = useRef<number | null>(null);
+  const qaPlaybackDrainCheckInFlightRef = useRef(false);
 
   const qaSessionActiveRef = useRef(false);
   const qaAwaitingUserRef = useRef(false);
@@ -597,6 +602,21 @@ export default function App() {
   function cancelQaListeningTransition() {
     qaListeningTransitionRef.current += 1;
     readyCuePlayerRef.current.stop();
+  }
+
+  function clearQaReadyCueDelayTimer() {
+    if (qaReadyCueDelayTimerRef.current != null) {
+      window.clearTimeout(qaReadyCueDelayTimerRef.current);
+      qaReadyCueDelayTimerRef.current = null;
+    }
+  }
+
+  function cancelQaResumeAfterPlayback(options?: { resetPendingChunks?: boolean }) {
+    qaResumeAfterPlaybackPendingRef.current = false;
+    clearQaReadyCueDelayTimer();
+    if (options?.resetPendingChunks) {
+      qaPendingPlaybackChunksRef.current = 0;
+    }
   }
 
   function resetTtsAudioSummary(taskId: string) {
@@ -714,6 +734,63 @@ export default function App() {
       await readyCuePlayerRef.current.playReadyCue();
     } catch (error) {
       appendQaLog(`[cue ${context}] failed: ${describeError(error)}`);
+    }
+  }
+
+  function scheduleQaResumeAfterPlayback() {
+    if (!qaResumeAfterPlaybackPendingRef.current || qaReadyCueDelayTimerRef.current != null) {
+      return;
+    }
+
+    qaReadyCueDelayTimerRef.current = window.setTimeout(() => {
+      qaReadyCueDelayTimerRef.current = null;
+      if (
+        !qaResumeAfterPlaybackPendingRef.current ||
+        !qaSessionActiveRef.current ||
+        isQaInErrorState() ||
+        isTaskActive(qaTtsStatusRef.current) ||
+        qaPendingPlaybackChunksRef.current > 0
+      ) {
+        return;
+      }
+
+      qaResumeAfterPlaybackPendingRef.current = false;
+      void enterQaListeningReady({ resumeCapture: true });
+    }, QA_READY_CUE_DELAY_MS);
+  }
+
+  async function checkQaPlaybackDrainAndResume() {
+    if (qaPlaybackDrainCheckInFlightRef.current) {
+      return;
+    }
+    qaPlaybackDrainCheckInFlightRef.current = true;
+
+    try {
+      if (
+        !qaResumeAfterPlaybackPendingRef.current ||
+        !qaSessionActiveRef.current ||
+        isQaInErrorState() ||
+        isTaskActive(qaTtsStatusRef.current) ||
+        qaPendingPlaybackChunksRef.current > 0
+      ) {
+        return;
+      }
+
+      await playerRef.current.waitForIdle();
+
+      if (
+        !qaResumeAfterPlaybackPendingRef.current ||
+        !qaSessionActiveRef.current ||
+        isQaInErrorState() ||
+        isTaskActive(qaTtsStatusRef.current) ||
+        qaPendingPlaybackChunksRef.current > 0
+      ) {
+        return;
+      }
+
+      scheduleQaResumeAfterPlayback();
+    } finally {
+      qaPlaybackDrainCheckInFlightRef.current = false;
     }
   }
 
@@ -911,6 +988,7 @@ export default function App() {
 
         if (message.type === 'task.started') {
           cancelQaListeningTransition();
+          cancelQaResumeAfterPlayback({ resetPendingChunks: true });
           clearQaPendingUtterance();
           setQaTtsStatusValue('STREAMING');
           pendingBinaryRef.current = [];
@@ -929,6 +1007,7 @@ export default function App() {
           return;
         }
         if (message.type === 'tts.audio.chunk') {
+          qaPendingPlaybackChunksRef.current += 1;
           pendingBinaryRef.current.push({ taskId: QA_TTS_TASK_ID, seq: message.seq ?? 0 });
           trackTtsChunk(QA_TTS_TASK_ID, message.byteLength ?? 0, () => appendQaLog('Receiving audio...'));
           return;
@@ -950,6 +1029,7 @@ export default function App() {
         }
         if (message.type === 'error') {
           cancelQaListeningTransition();
+          cancelQaResumeAfterPlayback({ resetPendingChunks: true });
           clearQaPendingUtterance();
           resetQaChatContext();
           setQaError(`${message.code ?? 'ERROR'}: ${message.message ?? 'unknown error'}`);
@@ -966,7 +1046,8 @@ export default function App() {
             setQaTtsStatusValue('STOPPED');
           }
           if (qaSessionActiveRef.current) {
-            void enterQaListeningReady({ resumeCapture: true });
+            qaResumeAfterPlaybackPendingRef.current = true;
+            void checkQaPlaybackDrainAndResume();
           }
         }
       }
@@ -983,7 +1064,12 @@ export default function App() {
       }
 
       if (pending.taskId === QA_TTS_TASK_ID) {
-        await playerRef.current.enqueue(buffer, qaTtsSampleRate, qaTtsChannels);
+        try {
+          await playerRef.current.enqueue(buffer, qaTtsSampleRate, qaTtsChannels);
+        } finally {
+          qaPendingPlaybackChunksRef.current = Math.max(0, qaPendingPlaybackChunksRef.current - 1);
+        }
+        void checkQaPlaybackDrainAndResume();
       }
     },
     onOpen: () => {
@@ -993,6 +1079,7 @@ export default function App() {
     },
     onClose: () => {
       cancelQaListeningTransition();
+      cancelQaResumeAfterPlayback({ resetPendingChunks: true });
       clearQaPendingUtterance();
       resetQaChatContext();
       resetAllAudioCaptureState();
@@ -1235,6 +1322,7 @@ export default function App() {
     }
 
     cancelQaListeningTransition();
+    cancelQaResumeAfterPlayback({ resetPendingChunks: true });
     resetQaConversationView();
     resetQaChatContext();
     qaAcceptChatUpdatesRef.current = true;
@@ -1272,6 +1360,7 @@ export default function App() {
 
   function stopQa() {
     cancelQaListeningTransition();
+    cancelQaResumeAfterPlayback({ resetPendingChunks: true });
     setQaSessionActiveValue(false);
     qaAwaitingUserRef.current = false;
     setQaNotice('');
