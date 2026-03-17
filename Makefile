@@ -2,7 +2,7 @@ APP_NAME := voice-server
 BIN_DIR := bin
 BIN_PATH := $(BIN_DIR)/$(APP_NAME)
 
-.PHONY: build run test frontend-install frontend-dev frontend-build docker-build docker-up docker-down clean
+.PHONY: build run test frontend-install frontend-dev frontend-build docker-build docker-up docker-up-backend docker-down clean
 
 build:
 	mkdir -p $(BIN_DIR)
@@ -28,6 +28,9 @@ docker-build:
 
 docker-up:
 	docker compose up --build -d
+
+docker-up-backend:
+	docker compose up --build -d voice-server
 
 docker-down:
 	docker compose down
