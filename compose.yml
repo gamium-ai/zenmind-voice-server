@@ -1,5 +1,6 @@
 services:
   voice-server:
+    container_name: voice-server-backend
     build:
       context: .
       dockerfile: Dockerfile
@@ -21,6 +22,7 @@ services:
       - zenmind-network
 
   voice-console:
+    container_name: voice-server-frontend
     build:
       context: ./frontend
       dockerfile: Dockerfile
@@ -33,6 +35,8 @@ services:
     ports:
       - "${FRONTEND_PORT:-8088}:80"
     restart: unless-stopped
+    networks:
+      - zenmind-network
 
 networks:
   zenmind-network:
