@@ -52,7 +52,7 @@ make test
 - 环境变量契约文件：`.env.example`
 - `.env` 是端口与密钥的单一事实源，当前至少维护 `SERVER_PORT` 与 `FRONTEND_PORT`
 - `compose.yml` 里的 `${SERVER_PORT}` / `${FRONTEND_PORT}` 属于 compose 变量插值
-- `voice-server` 的 `env_file: .env` 属于容器运行时环境注入
+- `backend` service 的 `env_file: .env` 属于容器运行时环境注入
 - 最重要的部署路径约束是 `/api/voice/*`
 - 若由总网关接入，应直接把 `/api/voice/*` 反代到 backend，而不是依赖 console 前端
 - LLM QA 模式支持由客户端在 `tts.start.agentKey` 中动态指定员工；`APP_VOICE_TTS_LLM_RUNNER_AGENT_KEY` 仅作为默认回退。
@@ -69,8 +69,7 @@ make docker-up
 
 - `compose.yml` 是唯一标准 compose 入口
 - 若同时存在 `compose.yaml` 和 `docker-compose.yml`，Docker 会优先使用 `compose.yaml` 并给出多配置警告；当前已统一为单文件
-- `voice-server` 负责 backend
-- `voice-console` 仅用于本地调试控制台
+- `compose.yml` 中的 service 名统一为 `backend` 和 `frontend`
 - Compose 构建后的镜像标签统一为 `voice-server-backend:latest` 和 `voice-server-frontend:latest`
 - backend / frontend 的容器名也分别是 `voice-server-backend` 和 `voice-server-frontend`，便于结合 `docker ps` / `docker images` 排查部署状态
 - 若只启动 backend 容器，可使用 `make docker-up-backend`
