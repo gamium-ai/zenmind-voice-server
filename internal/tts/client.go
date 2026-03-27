@@ -187,6 +187,22 @@ func (s *dashScopeTtsStreamSession) run() {
 		return
 	}
 
+	// Wait for session.created before sending any data
+	_, createdMsg, err := conn.ReadMessage()
+	if err != nil {
+		_ = conn.Close()
+		s.fail(fmt.Errorf("realtime TTS request failed: %w", err))
+		return
+	}
+	var createdEvent map[string]any
+	if parseErr := json.Unmarshal(createdMsg, &createdEvent); parseErr == nil {
+		if eventType, _ := createdEvent["type"].(string); eventType != "session.created" {
+			_ = conn.Close()
+			s.fail(fmt.Errorf("expected session.created but got %s", eventType))
+			return
+		}
+	}
+
 	s.mu.Lock()
 	if s.terminated {
 		s.mu.Unlock()
