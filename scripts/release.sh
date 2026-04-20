@@ -4,70 +4,136 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RELEASE_ASSETS_DIR="$SCRIPT_DIR/release-assets"
+UNIX_ASSETS_DIR="$RELEASE_ASSETS_DIR/unix"
+WINDOWS_ASSETS_DIR="$RELEASE_ASSETS_DIR/windows"
+FRONTEND_DIR="$REPO_ROOT/frontend"
+EMBED_UI_DIR="$REPO_ROOT/internal/httpapi/ui"
 
-die() { echo "[release] $*" >&2; exit 1; }
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/release-common.sh"
 
-VERSION="${VERSION:-$(cat "$REPO_ROOT/VERSION" 2>/dev/null || echo "")}"
-[[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "VERSION must match vX.Y.Z (got: ${VERSION:-<empty>})"
+require_release_tools
+resolve_release_context
 
-if [[ -z "${ARCH:-}" ]]; then
-  case "$(uname -m)" in
-    x86_64|amd64) ARCH=amd64 ;;
-    arm64|aarch64) ARCH=arm64 ;;
-    *) die "cannot detect ARCH from $(uname -m); pass ARCH=amd64|arm64" ;;
+require_file "$REPO_ROOT/.env.example"
+require_dir "$RELEASE_ASSETS_DIR"
+require_dir "$UNIX_ASSETS_DIR"
+require_dir "$WINDOWS_ASSETS_DIR"
+require_file "$RELEASE_ASSETS_DIR/README.txt"
+require_file "$UNIX_ASSETS_DIR/start.sh"
+require_file "$UNIX_ASSETS_DIR/stop.sh"
+require_file "$UNIX_ASSETS_DIR/deploy.sh"
+require_file "$UNIX_ASSETS_DIR/scripts/program-common.sh"
+require_file "$WINDOWS_ASSETS_DIR/start.ps1"
+require_file "$WINDOWS_ASSETS_DIR/stop.ps1"
+require_file "$WINDOWS_ASSETS_DIR/deploy.ps1"
+require_file "$WINDOWS_ASSETS_DIR/scripts/program-common.ps1"
+
+prepare_embedded_ui() {
+  echo "[release] building frontend for embedded UI..."
+  (
+    cd "$FRONTEND_DIR"
+    npm ci
+    npm run build
+  )
+
+  mkdir -p "$EMBED_UI_DIR"
+  find "$EMBED_UI_DIR" -mindepth 1 ! -name '.gitkeep' ! -name 'placeholder.txt' -exec rm -rf {} +
+  cp -R "$FRONTEND_DIR/dist/." "$EMBED_UI_DIR/"
+  require_file "$EMBED_UI_DIR/index.html"
+}
+
+copy_platform_assets() {
+  local target_os="$1"
+  local bundle_root="$2"
+
+  mkdir -p "$bundle_root/scripts"
+
+  case "$target_os" in
+    darwin|linux)
+      cp "$UNIX_ASSETS_DIR/deploy.sh" "$bundle_root/deploy.sh"
+      cp "$UNIX_ASSETS_DIR/start.sh" "$bundle_root/start.sh"
+      cp "$UNIX_ASSETS_DIR/stop.sh" "$bundle_root/stop.sh"
+      cp "$UNIX_ASSETS_DIR/scripts/program-common.sh" "$bundle_root/scripts/program-common.sh"
+      chmod +x \
+        "$bundle_root/deploy.sh" \
+        "$bundle_root/start.sh" \
+        "$bundle_root/stop.sh" \
+        "$bundle_root/scripts/program-common.sh"
+      ;;
+    windows)
+      cp "$WINDOWS_ASSETS_DIR/deploy.ps1" "$bundle_root/deploy.ps1"
+      cp "$WINDOWS_ASSETS_DIR/start.ps1" "$bundle_root/start.ps1"
+      cp "$WINDOWS_ASSETS_DIR/stop.ps1" "$bundle_root/stop.ps1"
+      cp "$WINDOWS_ASSETS_DIR/scripts/program-common.ps1" "$bundle_root/scripts/program-common.ps1"
+      ;;
+    *)
+      die "unsupported target os: $target_os"
+      ;;
   esac
-fi
+}
 
-PLATFORM="linux/$ARCH"
-BACKEND_IMAGE="voice-server-backend:$VERSION"
-FRONTEND_IMAGE="voice-server-frontend:$VERSION"
-BUNDLE_DIR_NAME="zenmind-voice-server"
-BUNDLE_NAME="${BUNDLE_DIR_NAME}-${VERSION}-linux-${ARCH}"
-BUNDLE_TAR="$REPO_ROOT/dist/release/${BUNDLE_NAME}.tar.gz"
+build_program_bundle() {
+  local target_os="$1"
+  local target_arch="$2"
+  local binary_name
+  local archive_format
+  local bundle_archive
+  local tmp_dir
+  local stage_root
+  local bundle_root
+  local backend_dir
+  local backend_path
+  local backend_entry
 
-echo "[release] VERSION=$VERSION ARCH=$ARCH PLATFORM=$PLATFORM"
+  validate_target_pair "$target_os" "$target_arch"
+  require_archive_tool_for_os "$target_os"
 
-command -v docker >/dev/null 2>&1 || die "docker is required"
+  binary_name="$(binary_name_for_os "$target_os")"
+  archive_format="$(archive_format_for_os "$target_os")"
+  bundle_archive="$RELEASE_DIR/$(program_bundle_filename "$VERSION" "$target_os" "$target_arch" "$archive_format")"
 
-TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/zenmind-voice-release.XXXXXX")"
-trap 'rm -rf "$TMP_DIR"' EXIT
+  echo "[release] building program bundle VERSION=$VERSION TARGET_OS=$target_os ARCH=$target_arch"
 
-IMAGES_DIR="$TMP_DIR/images"
-mkdir -p "$IMAGES_DIR"
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/zenmind-voice-program-release.XXXXXX")"
+  trap 'rm -rf "$tmp_dir"' RETURN
 
-echo "[release] building backend image..."
-docker buildx build \
-  --platform "$PLATFORM" \
-  --file "$REPO_ROOT/Dockerfile" \
-  --tag "$BACKEND_IMAGE" \
-  --output "type=docker,dest=$IMAGES_DIR/voice-server-backend.tar" \
-  "$REPO_ROOT"
+  stage_root="$tmp_dir/stage"
+  bundle_root="$stage_root/$APP_ID"
+  backend_dir="$bundle_root/backend"
+  backend_path="$backend_dir/$binary_name"
+  backend_entry="backend/$binary_name"
 
-echo "[release] building frontend image..."
-docker buildx build \
-  --platform "$PLATFORM" \
-  --file "$REPO_ROOT/frontend/Dockerfile" \
-  --tag "$FRONTEND_IMAGE" \
-  --output "type=docker,dest=$IMAGES_DIR/voice-server-frontend.tar" \
-  "$REPO_ROOT/frontend"
+  mkdir -p "$backend_dir"
 
-BUNDLE_ROOT="$TMP_DIR/$BUNDLE_DIR_NAME"
-mkdir -p "$BUNDLE_ROOT/images"
+  (
+    cd "$REPO_ROOT"
+    CGO_ENABLED=0 GOOS="$target_os" GOARCH="$target_arch" \
+      go build \
+      -trimpath \
+      -ldflags "-s -w -X main.buildVersion=$VERSION" \
+      -o "$backend_path" \
+      ./cmd/voice-server
+  )
 
-cp "$RELEASE_ASSETS_DIR/compose.release.yml" "$BUNDLE_ROOT/compose.release.yml"
-cp "$RELEASE_ASSETS_DIR/start.sh" "$BUNDLE_ROOT/start.sh"
-cp "$RELEASE_ASSETS_DIR/stop.sh" "$BUNDLE_ROOT/stop.sh"
-cp "$RELEASE_ASSETS_DIR/README.txt" "$BUNDLE_ROOT/README.txt"
-cp "$REPO_ROOT/.env.example" "$BUNDLE_ROOT/.env.example"
-cp "$IMAGES_DIR/voice-server-backend.tar" "$BUNDLE_ROOT/images/"
-cp "$IMAGES_DIR/voice-server-frontend.tar" "$BUNDLE_ROOT/images/"
+  cp "$REPO_ROOT/.env.example" "$bundle_root/.env.example"
+  cp "$RELEASE_ASSETS_DIR/README.txt" "$bundle_root/README.txt"
+  copy_platform_assets "$target_os" "$bundle_root"
+  write_program_manifest "$bundle_root/manifest.json" "$target_os" "$target_arch" "$backend_entry" "$(basename "$bundle_archive")"
 
-sed -i.bak "s/^VOICE_SERVER_VERSION=.*/VOICE_SERVER_VERSION=$VERSION/" "$BUNDLE_ROOT/.env.example"
-rm -f "$BUNDLE_ROOT/.env.example.bak"
+  if [[ "$target_os" != "windows" ]]; then
+    chmod +x "$backend_path"
+  fi
 
-chmod +x "$BUNDLE_ROOT/start.sh" "$BUNDLE_ROOT/stop.sh"
+  mkdir -p "$RELEASE_DIR"
+  archive_bundle_dir "$stage_root" "$APP_ID" "$bundle_archive" "$archive_format"
+  echo "[release] done: $bundle_archive"
+}
 
-mkdir -p "$(dirname "$BUNDLE_TAR")"
-tar -czf "$BUNDLE_TAR" -C "$TMP_DIR" "$BUNDLE_DIR_NAME"
+prepare_embedded_ui
 
-echo "[release] done: $BUNDLE_TAR"
+while read -r target_os target_arch; do
+  [[ -n "$target_os" ]] || continue
+  [[ -n "$target_arch" ]] || die "missing ARCH for target $target_os"
+  build_program_bundle "$target_os" "$target_arch"
+done < <(parse_program_target_matrix)

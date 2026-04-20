@@ -1,10 +1,12 @@
 package httpapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"testing/fstest"
 
 	"zenmind-voice-server/internal/config"
 	"zenmind-voice-server/internal/tts"
@@ -13,7 +15,7 @@ import (
 func TestCapabilities(t *testing.T) {
 	app := &config.App{}
 	*app = *configTestApp()
-	api := New(app, tts.NewVoiceCatalog(app))
+	api := NewWithUIFS(app, tts.NewVoiceCatalog(app), testUIFS())
 	mux := http.NewServeMux()
 	api.Register(mux)
 
@@ -76,7 +78,7 @@ func TestCapabilities(t *testing.T) {
 func TestVoices(t *testing.T) {
 	app := &config.App{}
 	*app = *configTestApp()
-	api := New(app, tts.NewVoiceCatalog(app))
+	api := NewWithUIFS(app, tts.NewVoiceCatalog(app), testUIFS())
 	mux := http.NewServeMux()
 	api.Register(mux)
 
@@ -109,6 +111,88 @@ func TestVoices(t *testing.T) {
 	}
 }
 
+func TestStaticRoutesServeEmbeddedUI(t *testing.T) {
+	app := &config.App{}
+	*app = *configTestApp()
+	api := NewWithUIFS(app, tts.NewVoiceCatalog(app), testUIFS())
+	mux := http.NewServeMux()
+	api.Register(mux)
+
+	rootReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	rootRec := httptest.NewRecorder()
+	mux.ServeHTTP(rootRec, rootReq)
+
+	if rootRec.Code != http.StatusOK {
+		t.Fatalf("GET / expected 200, got %d", rootRec.Code)
+	}
+	if !bytes.Contains(rootRec.Body.Bytes(), []byte("Embedded Voice Console")) {
+		t.Fatalf("GET / body = %q, want embedded index html", rootRec.Body.String())
+	}
+
+	assetReq := httptest.NewRequest(http.MethodGet, "/assets/app.js", nil)
+	assetRec := httptest.NewRecorder()
+	mux.ServeHTTP(assetRec, assetReq)
+
+	if assetRec.Code != http.StatusOK {
+		t.Fatalf("GET /assets/app.js expected 200, got %d", assetRec.Code)
+	}
+	if !bytes.Contains(assetRec.Body.Bytes(), []byte("console.log('voice console')")) {
+		t.Fatalf("GET /assets/app.js body = %q, want embedded asset", assetRec.Body.String())
+	}
+}
+
+func TestStaticRoutesFallbackToIndexHTML(t *testing.T) {
+	app := &config.App{}
+	*app = *configTestApp()
+	api := NewWithUIFS(app, tts.NewVoiceCatalog(app), testUIFS())
+	mux := http.NewServeMux()
+	api.Register(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/qa/session/demo", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("Embedded Voice Console")) {
+		t.Fatalf("fallback body = %q, want index html", rec.Body.String())
+	}
+}
+
+func TestStaticRoutesDoNotInterceptAPIPrefixes(t *testing.T) {
+	app := &config.App{}
+	*app = *configTestApp()
+	api := NewWithUIFS(app, tts.NewVoiceCatalog(app), testUIFS())
+	mux := http.NewServeMux()
+	api.Register(mux)
+
+	apiReq := httptest.NewRequest(http.MethodGet, "/api/voice/capabilities", nil)
+	apiRec := httptest.NewRecorder()
+	mux.ServeHTTP(apiRec, apiReq)
+
+	if apiRec.Code != http.StatusOK {
+		t.Fatalf("GET /api/voice/capabilities expected 200, got %d", apiRec.Code)
+	}
+	if got := apiRec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("GET /api/voice/capabilities content-type = %q, want application/json", got)
+	}
+
+	missingAPIReq := httptest.NewRequest(http.MethodGet, "/api/missing", nil)
+	missingAPIRec := httptest.NewRecorder()
+	mux.ServeHTTP(missingAPIRec, missingAPIReq)
+	if missingAPIRec.Code != http.StatusNotFound {
+		t.Fatalf("GET /api/missing expected 404, got %d", missingAPIRec.Code)
+	}
+
+	missingActuatorReq := httptest.NewRequest(http.MethodGet, "/actuator/missing", nil)
+	missingActuatorRec := httptest.NewRecorder()
+	mux.ServeHTTP(missingActuatorRec, missingActuatorReq)
+	if missingActuatorRec.Code != http.StatusNotFound {
+		t.Fatalf("GET /actuator/missing expected 404, got %d", missingActuatorRec.Code)
+	}
+}
+
 func configTestApp() *config.App {
 	app := &config.App{
 		ServerPort: 11953,
@@ -131,4 +215,15 @@ func configTestApp() *config.App {
 		{ID: "Serena", DisplayName: "Serena", Provider: "dashscope"},
 	}
 	return app
+}
+
+func testUIFS() fstest.MapFS {
+	return fstest.MapFS{
+		"index.html": {
+			Data: []byte("<!doctype html><html><body>Embedded Voice Console</body></html>"),
+		},
+		"assets/app.js": {
+			Data: []byte("console.log('voice console')"),
+		},
+	}
 }

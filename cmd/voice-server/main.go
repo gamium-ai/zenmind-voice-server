@@ -17,6 +17,8 @@ import (
 	"zenmind-voice-server/internal/ws"
 )
 
+var buildVersion = "dev"
+
 func main() {
 	cfg, err := config.Load(".")
 	if err != nil {
@@ -44,7 +46,7 @@ func main() {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("voice server listening on %s", server.Addr)
+		log.Printf("voice server listening on %s (version=%s)", server.Addr, buildVersion)
 		if serveErr := server.ListenAndServe(); serveErr != nil && serveErr != http.ErrServerClosed {
 			errCh <- serveErr
 		}

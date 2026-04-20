@@ -1,27 +1,46 @@
 package httpapi
 
 import (
+	"bytes"
+	"embed"
 	"encoding/json"
+	"errors"
+	"io"
+	"io/fs"
 	"net/http"
+	"path"
 	"strings"
 
 	"zenmind-voice-server/internal/config"
 	"zenmind-voice-server/internal/tts"
 )
 
+//go:embed ui
+var embeddedUIFiles embed.FS
+
 type API struct {
 	app          *config.App
 	voiceCatalog *tts.VoiceCatalog
+	uiFS         fs.FS
 }
 
 func New(app *config.App, voiceCatalog *tts.VoiceCatalog) *API {
-	return &API{app: app, voiceCatalog: voiceCatalog}
+	return NewWithUIFS(app, voiceCatalog, mustEmbeddedUIFS())
+}
+
+func NewWithUIFS(app *config.App, voiceCatalog *tts.VoiceCatalog, uiFS fs.FS) *API {
+	return &API{app: app, voiceCatalog: voiceCatalog, uiFS: uiFS}
 }
 
 func (a *API) Register(mux *http.ServeMux) {
-	mux.HandleFunc("/api/voice/capabilities", a.capabilities)
-	mux.HandleFunc("/api/voice/tts/voices", a.voices)
-	mux.HandleFunc("/actuator/health", a.health)
+	apiMux := http.NewServeMux()
+	apiMux.HandleFunc("/api/voice/capabilities", a.capabilities)
+	apiMux.HandleFunc("/api/voice/tts/voices", a.voices)
+	apiMux.HandleFunc("/actuator/health", a.health)
+
+	mux.Handle("/api/", apiMux)
+	mux.Handle("/actuator/", apiMux)
+	mux.Handle("/", http.HandlerFunc(a.serveStatic))
 }
 
 func (a *API) capabilities(w http.ResponseWriter, _ *http.Request) {
@@ -91,8 +110,83 @@ func (a *API) health(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+func (a *API) serveStatic(w http.ResponseWriter, r *http.Request) {
+	if a.uiFS == nil {
+		http.Error(w, "embedded UI is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	filePath := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
+	if filePath == "" || filePath == "." {
+		filePath = "index.html"
+	}
+
+	if served, err := serveIfPresent(w, r, a.uiFS, filePath); err == nil && served {
+		return
+	}
+
+	if served, err := serveIfPresent(w, r, a.uiFS, "index.html"); err == nil && served {
+		return
+	}
+
+	http.Error(w, "embedded UI build is missing index.html; run make frontend-build-embed", http.StatusServiceUnavailable)
+}
+
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func mustEmbeddedUIFS() fs.FS {
+	uiFS, err := fs.Sub(embeddedUIFiles, "ui")
+	if err != nil {
+		panic(err)
+	}
+	return uiFS
+}
+
+func serveIfPresent(w http.ResponseWriter, r *http.Request, uiFS fs.FS, filePath string) (bool, error) {
+	filePath = strings.TrimPrefix(filePath, "/")
+	if filePath == "" || filePath == "." {
+		filePath = "index.html"
+	}
+
+	info, err := fs.Stat(uiFS, filePath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if info.IsDir() {
+		nestedIndex := path.Join(filePath, "index.html")
+		nestedInfo, nestedErr := fs.Stat(uiFS, nestedIndex)
+		if nestedErr != nil {
+			if errors.Is(nestedErr, fs.ErrNotExist) {
+				return false, nil
+			}
+			return false, nestedErr
+		}
+		info = nestedInfo
+		filePath = nestedIndex
+	}
+
+	file, err := uiFS.Open(filePath)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+
+	reader, ok := file.(io.ReadSeeker)
+	if !ok {
+		data, readErr := io.ReadAll(file)
+		if readErr != nil {
+			return false, readErr
+		}
+		reader = bytes.NewReader(data)
+	}
+
+	http.ServeContent(w, r, info.Name(), info.ModTime(), reader)
+	return true, nil
 }

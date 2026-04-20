@@ -2,6 +2,9 @@
 
 /frontend/node_modules/
 /frontend/dist/
+/internal/httpapi/ui/*
+!/internal/httpapi/ui/.gitkeep
+!/internal/httpapi/ui/placeholder.txt
 
 .DS_Store
 .idea/
